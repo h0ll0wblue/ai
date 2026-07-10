@@ -1,14 +1,8 @@
 # /// ---
 # Zephyros-600M -- GPU pre-training runner
 # ---
-# Run this as a notebook with a GPU accelerator (T4x2 or P100).
-# Runs for the full Kaggle session (9h limit) with checkpoints every 15 min.
-# Aborts if no GPU is detected.
-#
-# Tokens per optimizer step (auto-detected)
-#   single GPU 16GB (P100)   microBatch=1, gradAccumSteps=128 -> 524K tok/step
-#   dual   GPU 16GB (T4x2)   microBatch=1, gradAccumSteps=128 -> 1.0M tok/step
-#
+# Uses the official Flax NNX data-parallel pattern:
+#   NamedSharding + jax.device_put + @nnx.jit
 # Requires HF_TOKEN env var (set as Kaggle Secret).
 # Checkpoints save to HuggingFace Hub (private repo).
 # ///
@@ -16,11 +10,12 @@
 import os, sys, time, gc
 from pathlib import Path
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
@@ -32,12 +27,16 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if not any(d.platform == "gpu" for d in GPUS):
     sys.exit(f"No GPU found ({N_GPUS} x {GPU_KIND})")
 
-N_CHIPS = 1
+N_CHIPS = N_GPUS
 MICRO_BATCH_PER_CHIP = 1
 GRAD_ACCUM_STEPS = 128
 
-print(f"Device: {GPU_KIND}")
-print(f"Config: microBatch=1, gradAccum={GRAD_ACCUM_STEPS}")
+device_mesh = Mesh(mesh_utils.create_device_mesh((N_GPUS,)), ("data",))
+model_sharding = NamedSharding(device_mesh, PartitionSpec())
+data_sharding = NamedSharding(device_mesh, PartitionSpec("data"))
+
+print(f"Devices: {N_GPUS} x {GPU_KIND}")
+print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -123,7 +122,6 @@ from datasets import load_dataset, interleave_datasets
 print("\n[data] Loading datasets...")
 t0 = time.time()
 allDs = []
-allW = []
 for name, split, weight in DATASET_MIX:
     split = split or "train"
     print(f"  {name} ({split})...", end=" ", flush=True)
@@ -181,7 +179,7 @@ def dataGen():
 dataIter = dataGen()
 print(f"[data] Ready ({time.time()-t0:.1f}s)\n")
 
-# ── Model (only now, after data pipeline) ───────────────────────────────────
+# ── Model + Optimizer ───────────────────────────────────────────────────────
 
 from src.model import DecoderOnlyLM
 from src.checkpoint import serializeCheckpoint, deserializeCheckpoint
@@ -189,25 +187,42 @@ from src.checkpoint import serializeCheckpoint, deserializeCheckpoint
 print("[model] Creating 600M model...")
 t0 = time.time()
 model = DecoderOnlyLM(modelConfig, rngs=nnx.Rngs(0))
-print(f"[model] Created ({time.time()-t0:.1f}s)")
+optimizer = nnx.Optimizer(
+    model,
+    optax.chain(
+        optax.clip_by_global_norm(TRAINING_CONFIG["optimizer"]["gradClipNorm"]),
+        optax.adamw(lrSchedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.01),
+    ),
+    wrt=nnx.Param,
+)
+state = nnx.state((model, optimizer))
+state = jax.device_put(state, model_sharding)
+nnx.update((model, optimizer), state)
+print(f"[model] Created + replicated ({time.time()-t0:.1f}s)")
 
 # ── Checkpoint Resume ───────────────────────────────────────────────────────
 
-def tryResume(model, optimizer):
+def tryResume():
     gs, ts = 0, 0
     try:
         p = hf_hub_download(REPO_ID, CKPT_FILE, token=hfToken)
         gs, ts = deserializeCheckpoint(model, optimizer, Path(p).read_bytes())
+        state = nnx.state((model, optimizer))
+        state = jax.device_put(state, model_sharding)
+        nnx.update((model, optimizer), state)
         print(f"  Resumed step {gs} ({ts:,} tokens)")
     except Exception as e:
         print(f"  Fresh start ({e})")
-    return model, gs, ts
+    return gs, ts
 
-def saveCheckpoint(model, optimizer, gs, ts):
+def saveCheckpoint(gs, ts):
     d = Path("/kaggle/working/checkpoints")
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"checkpoint-{gs}.msgpack"
     try:
+        state = nnx.state((model, optimizer))
+        state = jax.device_get(state)
+        nnx.update((model, optimizer), state)
         b = serializeCheckpoint(model, optimizer, gs, ts)
         p.write_bytes(b)
         nb = len(b)
@@ -218,26 +233,18 @@ def saveCheckpoint(model, optimizer, gs, ts):
     except Exception as e:
         print(f"  [WARN] Save failed: {e}")
 
-# ── Optimizer + JIT Step ────────────────────────────────────────────────────
+globalStep, tokensSeen = tryResume()
 
-optimizer = nnx.Optimizer(
-    model,
-    optax.chain(
-        optax.clip_by_global_norm(TRAINING_CONFIG["optimizer"]["gradClipNorm"]),
-        optax.adamw(lrSchedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.01),
-    ),
-    wrt=nnx.Param,
-)
-model, globalStep, tokensSeen = tryResume(model, optimizer)
+# ── JIT-Compiled Micro-Step ─────────────────────────────────────────────────
 
 @nnx.remat
 def lossFn(m, batch):
     lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
 
-gradFn = nnx.value_and_grad(lossFn)
-
-print("First step will compile the backward pass (3-10 min)...")
+@nnx.jit
+def microStep(model, batch):
+    return nnx.value_and_grad(lossFn)(model, batch)
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -271,11 +278,15 @@ try:
 
             batch = {
                 "inputIds": jnp.stack(inpSeq),
-                "positions": jnp.broadcast_to(jnp.arange(SEQ_LEN, dtype=jnp.int32), (MICRO_BATCH_SIZE, SEQ_LEN)),
+                "positions": jnp.broadcast_to(
+                    jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                    (MICRO_BATCH_SIZE, SEQ_LEN),
+                ),
                 "targetIds": jnp.stack(tgtSeq),
             }
+            batch = jax.device_put(batch, data_sharding)
 
-            loss, grads = gradFn(model, batch)
+            loss, grads = microStep(model, batch)
 
             gradAccum = grads if gradAccum is None else jax.tree.map(jnp.add, gradAccum, grads)
             lossAccum += float(loss)
@@ -298,7 +309,7 @@ try:
         print(f"  step {step:6d} | loss {avgLoss:.4f} | lr {lr:.2e} | tok/s {tps:,.0f} | {int(e)}s")
 
         if time.time() - lastCkptTime >= CKPT_INTERVAL:
-            saveCheckpoint(model, optimizer, step, totalTokens)
+            saveCheckpoint(step, totalTokens)
             lastCkptTime = time.time()
 
 except Exception as e:
@@ -307,7 +318,7 @@ except Exception as e:
     raise
 finally:
     try:
-        saveCheckpoint(model, optimizer, step, totalTokens)
+        saveCheckpoint(step, totalTokens)
     except Exception as e2:
         print(f"  Final save failed: {e2}")
     e = time.time() - startTime
