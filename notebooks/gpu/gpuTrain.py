@@ -99,7 +99,7 @@ REPO_ID = TRAINING_CONFIG["checkpoint"]["weightsRepo"]
 CKPT_FILE = "checkpoint.msgpack"
 
 DATASET_MIX: list[tuple[str, str | None, float]] = [
-    ("HuggingFaceTB/fineweb-edu", "train", 0.60),
+    ("HuggingFaceFW/fineweb", "train", 0.60),
     ("emozilla/pg19", "train", 0.15),
     ("bookcorpus2", None, 0.10),
     ("AI-MO/NuminaMath-CoT", None, 0.05),
@@ -191,10 +191,11 @@ def preflightCheck():
     # 7. Dataset access
     try:
         from datasets import load_dataset
-        ds = load_dataset(DATASET_MIX[0][0], split="train", streaming=True)
+        checkDs = "emozilla/pg19"
+        ds = load_dataset(checkDs, split="train", streaming=True)
         sample = next(iter(ds))
-        assert "text" in sample or "content" in sample
-        print(f"  [OK] HuggingFace datasets accessible (sampled {DATASET_MIX[0][0]})")
+        assert "text" in sample
+        print(f"  [OK] HuggingFace datasets accessible (sampled {checkDs})")
         del ds
     except Exception as e:
         warnings.append(f"Dataset streaming check failed: {e}")
