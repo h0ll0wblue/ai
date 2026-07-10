@@ -71,7 +71,6 @@ DATASET_MIX: list[tuple[str, str | None, float]] = [
     ("emozilla/pg19", "train", 0.20),
     ("AI-MO/NuminaMath-CoT", None, 0.07),
     ("open-web-math/open-web-math", "train", 0.05),
-    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 0.03),
 ]
 
 # ── Quick Checks ────────────────────────────────────────────────────────────
@@ -231,16 +230,12 @@ optimizer = nnx.Optimizer(
 model, globalStep, tokensSeen = tryResume(model, optimizer)
 
 def lossFn(m, batch):
-    lg = m(batch["inputIds"], batch["positions"], enableDropout=True)
+    lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
 
-gradFn = nnx.value_and_grad(lossFn)
+gradFn = nnx.value_and_grad(lossFn, wrt=nnx.Param)
 
-@nnx.jit
-def trainStep(m, batch):
-    return gradFn(m, batch)
-
-print("Compiling first training step (may take 3-10 min)...")
+print("First step will compile the backward pass (3-10 min)...")
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -278,7 +273,7 @@ try:
                 "targetIds": jnp.stack(tgtSeq),
             }
 
-            loss, grads = trainStep(model, batch)
+            loss, grads = gradFn(model, batch)
 
             gradAccum = grads if gradAccum is None else jax.tree.map(jnp.add, gradAccum, grads)
             lossAccum += float(loss)
