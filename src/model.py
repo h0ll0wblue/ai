@@ -27,25 +27,26 @@ class DecoderOnlyLM(nnx.Module):
             rngs=nnx.Rngs(embedKey),
         )
 
+        self.nLayers = config.nLayers
         layerKeys = jax.random.split(layersKey, config.nLayers)
-        self.blocks = nnx.List([
-            TransformerBlock(
-                config.dModel, config.dFF,
-                config.nQueryHeads, config.nKVHeads,
-                config.headDim, config.maxSeqLen,
-                config.ropeTheta, config.rmsNormEps,
-                rngs=nnx.Rngs(layerKeys[i]),
-                attnDropout=self.attnDropout,
+        for i in range(config.nLayers):
+            setattr(self, f"block_{i}",
+                TransformerBlock(
+                    config.dModel, config.dFF,
+                    config.nQueryHeads, config.nKVHeads,
+                    config.headDim, config.maxSeqLen,
+                    config.ropeTheta, config.rmsNormEps,
+                    rngs=nnx.Rngs(layerKeys[i]),
+                    attnDropout=self.attnDropout,
+                )
             )
-            for i in range(config.nLayers)
-        ])
 
         self.finalNorm = RmsNorm(config.dModel, config.rmsNormEps)
 
     def __call__(self, inputIds: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         x = self.tokenEmbed(inputIds)
-        for block in self.blocks:
-            x = block(x, positions, enableDropout=enableDropout)
+        for i in range(self.nLayers):
+            x = getattr(self, f"block_{i}")(x, positions, enableDropout=enableDropout)
         x = self.finalNorm(x)
         logits = x @ self.tokenEmbed.weight.T
         return logits

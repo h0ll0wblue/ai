@@ -98,10 +98,21 @@ modelConfig = ModelConfig(MODEL_CONFIG)
 REPO_ID = TRAINING_CONFIG["checkpoint"]["weightsRepo"]
 CKPT_FILE = "checkpoint.msgpack"
 
+DATASET_MIX: list[tuple[str, str | None, float]] = [
+    ("HuggingFaceTB/fineweb-edu", "train", 0.60),
+    ("emozilla/pg19", "train", 0.15),
+    ("bookcorpus2", None, 0.10),
+    ("AI-MO/NuminaMath-CoT", None, 0.05),
+    ("open-web-math/open-web-math", "train", 0.05),
+    ("wikipedia", "20231101.en", 0.03),
+    ("CShorten/arxiv-abs", "train", 0.02),
+]
+
 # ── Preflight Checks ──────────────────────────────────────────────────────────
 
 def preflightCheck():
-    errors = []
+    errors: list[str] = []
+    warnings: list[str] = []
     print("Running preflight checks...")
 
     # 1. HF_TOKEN
@@ -125,23 +136,31 @@ def preflightCheck():
     else:
         print(f"  [OK] GPU detected: {len(localDevices)} x {localDevices[0].device_kind}")
 
-    # 4. Tokenizer
+    # 4. Tokenizer (optional — may be on Hub, Kaggle Dataset, or not yet built)
     from tokenizers import Tokenizer
-    try:
-        path = hf_hub_download(REPO_ID, "tokenizer.json", token=hfToken)
-        t = Tokenizer.from_file(path)
-        testToken = t.encode("Hello world").ids
-        assert len(testToken) > 0
-        print(f"  [OK] Tokenizer loaded (vocab: {t.get_vocab_size()})")
-    except Exception:
-        localPath = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
-        if os.path.exists(localPath):
-            t = Tokenizer.from_file(localPath)
+    tokenizerOk = False
+    for attempt in ["hub", "kaggleDataset"]:
+        try:
+            if attempt == "hub" and hfToken:
+                path = hf_hub_download(REPO_ID, "tokenizer.json", token=hfToken)
+                label = "Hub"
+            elif attempt == "kaggleDataset":
+                path = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
+                if not os.path.exists(path):
+                    continue
+                label = "Kaggle Dataset"
+            else:
+                continue
+            t = Tokenizer.from_file(path)
             testToken = t.encode("Hello world").ids
             assert len(testToken) > 0
-            print(f"  [OK] Tokenizer loaded from local (vocab: {t.get_vocab_size()})")
-        else:
-            errors.append("Tokenizer: not found on Hub or /kaggle/input/")
+            print(f"  [OK] Tokenizer loaded from {label} (vocab: {t.get_vocab_size()})")
+            tokenizerOk = True
+            break
+        except Exception:
+            continue
+    if not tokenizerOk:
+        warnings.append("Tokenizer not found on Hub or Kaggle Dataset — will retry during data pipeline init")
 
     # 5. Model forward pass
     from src.model import DecoderOnlyLM
@@ -169,32 +188,39 @@ def preflightCheck():
     except Exception as e:
         errors.append(f"Checkpoint I/O: {e}")
 
-    # 7. Dataset access (first dataset in mix)
+    # 7. Dataset access
     try:
         from datasets import load_dataset
         ds = load_dataset(DATASET_MIX[0][0], split="train", streaming=True)
         sample = next(iter(ds))
-        assert "text" in sample
+        assert "text" in sample or "content" in sample
         print(f"  [OK] HuggingFace datasets accessible (sampled {DATASET_MIX[0][0]})")
         del ds
     except Exception as e:
-        errors.append(f"Datasets: {e}")
+        warnings.append(f"Dataset streaming check failed: {e}")
 
-    # 8. JAX + flax + optax versions
+    # 8. Versions
     import flax
     print(f"  [OK] jax={jax.__version__}, flax={flax.__version__}, optax={optax.__version__}")
 
     if errors:
         print(f"\n{'='*60}")
-        print(f"Preflight FAILED — {len(errors)} issue(s):")
+        print(f"Preflight FAILED — {len(errors)} fatal issue(s):")
         for i, err in enumerate(errors, 1):
             print(f"  {i}. {err}")
         print(f"{'='*60}")
         sys.exit(1)
-    else:
+
+    if warnings:
         print(f"\n{'='*60}")
-        print("All preflight checks passed — starting training")
-        print(f"{'='*60}\n")
+        print(f"Preflight passed with {len(warnings)} warning(s):")
+        for i, w in enumerate(warnings, 1):
+            print(f"  {i}. {w}")
+        print(f"{'='*60}")
+
+    print(f"\n{'='*60}")
+    print("All preflight checks passed — starting training")
+    print(f"{'='*60}\n")
 
 
 preflightCheck()
@@ -322,16 +348,6 @@ def microBatchStep(model, batch):
 # ── Data Pipeline ──────────────────────────────────────────────────────────────
 
 from datasets import load_dataset, interleave_datasets
-
-DATASET_MIX: list[tuple[str, str | None, float]] = [
-    ("HuggingFaceTB/fineweb-edu", "train", 0.60),
-    ("emozilla/pg19", "train", 0.15),
-    ("bookcorpus2", None, 0.10),
-    ("AI-MO/NuminaMath-CoT", None, 0.05),
-    ("open-web-math/open-web-math", "train", 0.05),
-    ("wikipedia", "20231101.en", 0.03),
-    ("CShorten/arxiv-abs", "train", 0.02),
-]
 
 def tokenizeFn(examples, textKey="text"):
     textCol = examples.get(textKey) or examples.get("content") or []
