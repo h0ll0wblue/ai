@@ -95,15 +95,120 @@ class ModelConfig:
 
 modelConfig = ModelConfig(MODEL_CONFIG)
 
+REPO_ID = TRAINING_CONFIG["checkpoint"]["weightsRepo"]
+CKPT_FILE = "checkpoint.msgpack"
+
+# ── Preflight Checks ──────────────────────────────────────────────────────────
+
+def preflightCheck():
+    errors = []
+    print("Running preflight checks...")
+
+    # 1. HF_TOKEN
+    hfToken = os.environ.get("HF_TOKEN", "")
+    if not hfToken:
+        errors.append("HF_TOKEN not set — add it as a Kaggle Secret")
+    else:
+        print("  [OK] HF_TOKEN found")
+
+    # 2. HuggingFace Hub access
+    try:
+        create_repo(REPO_ID, exist_ok=True, token=hfToken, private=True)
+        print(f"  [OK] HuggingFace Hub accessible (repo: {REPO_ID})")
+    except Exception as e:
+        errors.append(f"HuggingFace Hub: {e}")
+
+    # 3. GPU
+    localDevices = jax.devices()
+    if not any(d.platform == "gpu" for d in localDevices):
+        errors.append("No GPU detected")
+    else:
+        print(f"  [OK] GPU detected: {len(localDevices)} x {localDevices[0].device_kind}")
+
+    # 4. Tokenizer
+    from tokenizers import Tokenizer
+    try:
+        path = hf_hub_download(REPO_ID, "tokenizer.json", token=hfToken)
+        t = Tokenizer.from_file(path)
+        testToken = t.encode("Hello world").ids
+        assert len(testToken) > 0
+        print(f"  [OK] Tokenizer loaded (vocab: {t.get_vocab_size()})")
+    except Exception:
+        localPath = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
+        if os.path.exists(localPath):
+            t = Tokenizer.from_file(localPath)
+            testToken = t.encode("Hello world").ids
+            assert len(testToken) > 0
+            print(f"  [OK] Tokenizer loaded from local (vocab: {t.get_vocab_size()})")
+        else:
+            errors.append("Tokenizer: not found on Hub or /kaggle/input/")
+
+    # 5. Model forward pass
+    from src.model import DecoderOnlyLM
+    try:
+        probeModel = DecoderOnlyLM(modelConfig, rngs=nnx.Rngs(0))
+        probeIds = jnp.zeros((1, 4), dtype=jnp.int32)
+        probePos = jnp.arange(4)
+        out = probeModel(probeIds, probePos, enableDropout=False)
+        assert out.shape == (1, 4, MODEL_CONFIG["vocabSize"])
+        nParams = sum(v.size for _, v in nnx.to_flat_state(nnx.state(probeModel, nnx.Param)))
+        print(f"  [OK] Model forward pass OK ({nParams:,} params)")
+        del probeModel
+    except Exception as e:
+        errors.append(f"Model forward pass: {e}")
+
+    # 6. Checkpoint I/O
+    from src.checkpoint import serializeCheckpoint
+    try:
+        probeModel2 = DecoderOnlyLM(modelConfig, rngs=nnx.Rngs(1))
+        probeOpt = nnx.Optimizer(probeModel2, optax.adamw(3e-4), wrt=nnx.Param)
+        _bytes = serializeCheckpoint(probeModel2, probeOpt, 0, 0)
+        assert len(_bytes) > 0
+        print(f"  [OK] Checkpoint serialization works ({len(_bytes)} bytes)")
+        del probeModel2, probeOpt
+    except Exception as e:
+        errors.append(f"Checkpoint I/O: {e}")
+
+    # 7. Dataset access (first dataset in mix)
+    try:
+        from datasets import load_dataset
+        ds = load_dataset(DATASET_MIX[0][0], split="train", streaming=True)
+        sample = next(iter(ds))
+        assert "text" in sample
+        print(f"  [OK] HuggingFace datasets accessible (sampled {DATASET_MIX[0][0]})")
+        del ds
+    except Exception as e:
+        errors.append(f"Datasets: {e}")
+
+    # 8. JAX + flax + optax versions
+    import flax
+    print(f"  [OK] jax={jax.__version__}, flax={flax.__version__}, optax={optax.__version__}")
+
+    if errors:
+        print(f"\n{'='*60}")
+        print(f"Preflight FAILED — {len(errors)} issue(s):")
+        for i, err in enumerate(errors, 1):
+            print(f"  {i}. {err}")
+        print(f"{'='*60}")
+        sys.exit(1)
+    else:
+        print(f"\n{'='*60}")
+        print("All preflight checks passed — starting training")
+        print(f"{'='*60}\n")
+
+
+preflightCheck()
+
 # ── Tokenizer ──────────────────────────────────────────────────────────────────
 
 from tokenizers import Tokenizer
 
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 TOKENIZER_REPO = "zephyros-600m"
 
 def loadTokenizer():
     try:
-        path = hf_hub_download(TOKENIZER_REPO, "tokenizer.json")
+        path = hf_hub_download(TOKENIZER_REPO, "tokenizer.json", token=HF_TOKEN)
         return Tokenizer.from_file(path)
     except Exception:
         localPath = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
@@ -122,12 +227,7 @@ model = DecoderOnlyLM(modelConfig, rngs=nnx.Rngs(0))
 
 # ── Checkpoint Resume ─────────────────────────────────────────────────────────
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-REPO_ID = TRAINING_CONFIG["checkpoint"]["weightsRepo"]
-CKPT_FILE = "checkpoint.msgpack"
-
 if HF_TOKEN:
-    create_repo(REPO_ID, exist_ok=True, token=HF_TOKEN, private=True)
     HF_API = HfApi(token=HF_TOKEN)
 else:
     HF_API = HfApi()
