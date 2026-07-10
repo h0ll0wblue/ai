@@ -62,6 +62,7 @@ MODEL_CONFIG = {
     "vocabSize": 49152, "dModel": 1280, "dFF": 4800, "nLayers": 24,
     "nQueryHeads": 20, "nKVHeads": 4, "headDim": 64, "maxSeqLen": 4096,
     "ropeTheta": 500000.0, "rmsNormEps": 1e-6, "tieEmbeddings": True,
+    "remat": True,
 }
 TRAINING_CONFIG = {
     "totalTokens": 12_000_000_000, "seqLen": 4096,
@@ -345,9 +346,8 @@ globalStep, tokensSeen = tryResume()
 #
 # Peak VRAM: 1 micro-batch activations (freed by remat) + full grad pytree.
 
-@nnx.remat
 def _loss_fn(model, batch):
-    """Forward pass; returns scalar loss. @nnx.remat discards activations."""
+    """Forward pass; returns scalar loss. Block-level remat handles activation memory."""
     logits = model(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(
         logits, batch["targetIds"]

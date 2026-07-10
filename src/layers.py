@@ -80,6 +80,7 @@ class GroupedQueryAttention(nnx.Module):
 
     def __call__(self, x: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         B, S, _ = x.shape
+        origDtype = x.dtype
 
         q = self.qProj(x).reshape(B, S, self.nHeads, self.headDim)
         k = self.kProj(x).reshape(B, S, self.nKVHeads, self.headDim)
@@ -96,17 +97,31 @@ class GroupedQueryAttention(nnx.Module):
         k = k[:, :, None, :, :]
         v = v[:, :, None, :, :]
 
+        # ── Attention in float16 to halve S×S matrix memory ──────────────
+        # scores/weights are [B, nKV, nGroups, S, S] = [1,4,5,4096,4096].
+        # In f32 each is 1.34 GB; in f16 each is 0.67 GB.
+        # During backward, 3 copies coexist (scores, weights, d_scores):
+        #   f32: 3 × 1.34 = 4.0 GB → OOM on 15 GB T4
+        #   f16: 3 × 0.67 = 2.0 GB → fits comfortably
+        q = q.astype(jnp.float16)
+        k = k.astype(jnp.float16)
+
         scores = jnp.einsum("bngsd,bnGtd->bngst", q, k) * self.scale
 
-        mask = jnp.triu(jnp.full((S, S), jnp.finfo(scores.dtype).min, dtype=scores.dtype), k=1)
+        mask = jnp.triu(jnp.full((S, S), jnp.finfo(jnp.float16).min, dtype=jnp.float16), k=1)
         scores = scores + mask
 
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(scores.dtype)
+        # Softmax in float32 for numerical stability, then back to float16
+        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(jnp.float16)
 
         if enableDropout and self.attnDropout > 0.0:
             weights = self.attnDropoutLayer(weights, deterministic=False)
 
+        v = v.astype(jnp.float16)
         output = jnp.einsum("bngst,bnGtd->bngsd", weights, v)
+
+        # Cast back to original dtype for output projection
+        output = output.astype(origDtype)
         output = output.reshape(B, self.nHeads, S, self.headDim)
         output = output.transpose(0, 2, 1, 3).reshape(B, S, self.nHeads * self.headDim)
         return self.outProj(output)
