@@ -22,7 +22,6 @@ from pathlib import Path
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ["XLA_FLAGS"] = (
-    "--xla_dump_to=/dev/null "
     "--xla_gpu_enable_triton_gemm=false "
     "--xla_gpu_enable_cudnn_fmha=false"
 )
