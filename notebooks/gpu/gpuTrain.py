@@ -21,7 +21,6 @@ os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
@@ -33,14 +32,12 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if not any(d.platform == "gpu" for d in GPUS):
     sys.exit(f"No GPU found ({N_GPUS} x {GPU_KIND})")
 
-N_CHIPS = N_GPUS
+N_CHIPS = 1
 MICRO_BATCH_PER_CHIP = 1
 GRAD_ACCUM_STEPS = 128
-Mesh(jax.devices(), ("data",))
-nnx.spmd.set_mesh(Mesh(jax.devices(), ("data",)))
 
-print(f"Devices: {N_GPUS} x {GPU_KIND}")
-print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
+print(f"Device: {GPU_KIND}")
+print(f"Config: microBatch=1, gradAccum={GRAD_ACCUM_STEPS}")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
