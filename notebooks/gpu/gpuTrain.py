@@ -365,57 +365,71 @@ print("Compiling training step (first step will be slow)...")
 
 from datasets import load_dataset, interleave_datasets
 
-def tokenizeFn(examples, textKey="text"):
-    textCol = examples.get(textKey) or examples.get("content") or []
-    if not textCol:
-        n = len(next(iter(examples.values()), []))
-        return {"inputIds": [[] for _ in range(n)]}
-    tokens = [tokenizer.encode(t).ids for t in textCol]
-    return {"inputIds": tokens}
-
 def makeDataPipeline(sessionSeed: int = 42):
-    loaded: list = []
-    loadedWeights: list[float] = []
+    t0 = time.time()
+    print("  [data] Loading datasets...")
+    allDs: list = []
+    allWeights: list[float] = []
     for name, split, weight in DATASET_MIX:
+        split = split or "train"
+        print(f"    {name} ({split})...", end=" ", flush=True)
         try:
-            ds = load_dataset(name, split=split or "train", streaming=True)
+            ds = load_dataset(name, split=split, streaming=True)
+            textKey = "text" if "text" in ds.features else list(ds.features.keys())[0]
+            allDs.append((ds, textKey, weight))
+            print(f"OK  ({time.time()-t0:.1f}s)")
         except Exception as e:
-            print(f"  [SKIP] {name}: {e}")
-            continue
-        dsFeatures = list(ds.features.keys())
-        textKey = "text" if "text" in dsFeatures else ("content" if "content" in dsFeatures else dsFeatures[0])
-        ds = ds.map(
-            lambda x, tk=textKey: tokenizeFn(x, tk),
-            remove_columns=dsFeatures,
-            batched=True,
-            batch_size=100,
-        )
-        loaded.append(ds)
-        loadedWeights.append(weight)
+            print(f"SKIP  ({e})")
+    if not allDs:
+        raise RuntimeError("No datasets available")
 
-    if not loaded:
-        raise RuntimeError("No datasets could be loaded.")
+    print("  [data] Setting up interleave + shuffle...")
+    sources = interleave_datasets(
+        [d for d, _, _ in allDs],
+        probabilities=[w / sum(w for _, _, w in allDs) for _, _, w in allDs],
+    )
+    sources = sources.shuffle(buffer_size=1000, seed=sessionSeed)
+    it = iter(sources)
+    textKeyMap = {id(d): tk for d, tk, _ in allDs}
 
-    totalW = sum(loadedWeights)
-    probs = [w / totalW for w in loadedWeights]
-    combined = interleave_datasets(loaded, probabilities=probs)
-    combined = combined.shuffle(buffer_size=1000, seed=sessionSeed)
+    print("  [data] Pre-buffering 4096 tokens...", end=" ", flush=True)
+    buf = []
+    n = 0
+    while len(buf) < 4096:
+        ex = next(it)
+        n += 1
+        for d, tk, _ in allDs:
+            if tk in ex:
+                t = ex[tk]
+                break
+        else:
+            t = ex.get("text") or ex.get("content") or list(ex.values())[0]
+        if isinstance(t, str):
+            buf.extend(tokenizer.encode(t).ids)
+    print(f"done  ({n} examples, {len(buf)} tokens, {time.time()-t0:.1f}s)\n")
 
-    def packAndBatch(iterator):
-        buffer = []
-        for example in iterator:
-            buffer.extend(example["inputIds"])
-            while len(buffer) >= SEQ_LEN:
-                seq = buffer[:SEQ_LEN]
-                buffer = buffer[SEQ_LEN:]
-                inputIds = jnp.array(seq, dtype=jnp.int32)
-                targetIds = jnp.concatenate([
-                    inputIds[1:],
-                    jnp.zeros((1,), dtype=jnp.int32),
-                ])
-                yield {"inputIds": inputIds, "targetIds": targetIds}
+    def generator():
+        nonlocal buf, it
+        while True:
+            if len(buf) < SEQ_LEN:
+                ex = next(it)
+                for d, tk, _ in allDs:
+                    if tk in ex:
+                        t = ex[tk]
+                        break
+                else:
+                    t = ex.get("text") or ex.get("content") or list(ex.values())[0]
+                if isinstance(t, str):
+                    buf.extend(tokenizer.encode(t).ids)
+            if len(buf) >= SEQ_LEN:
+                seq = buf[:SEQ_LEN]
+                buf = buf[SEQ_LEN:]
+                yield {
+                    "inputIds": jnp.array(seq, dtype=jnp.int32),
+                    "targetIds": jnp.array(seq[1:] + [0], dtype=jnp.int32),
+                }
 
-    return packAndBatch(combined)
+    return generator()
 
 # ── Main Training Loop ────────────────────────────────────────────────────────
 
