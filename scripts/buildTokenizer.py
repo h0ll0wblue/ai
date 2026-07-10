@@ -73,7 +73,7 @@ def buildTokenizer():
             dataFiles.append(tmpPath)
         print(f"  Starting BPE training on {len(dataFiles)} file(s)...")
         print(f"  This may take several minutes with no visible progress.")
-        tokenizer.train(trainer, dataFiles)
+        tokenizer.train(files=dataFiles, trainer=trainer)
         print(f"  BPE training complete!")
         for p in dataFiles:
             os.remove(p)
@@ -93,7 +93,7 @@ def buildTokenizer():
             print("  - Run with --from-datasets to train from HuggingFace datasets")
             print(f"  - Or create these files: {missing}")
             exit(1)
-        tokenizer.train(trainer, dataFiles)
+        tokenizer.train(files=dataFiles, trainer=trainer)
 
     print(f"  Actual vocab size: {tokenizer.get_vocab_size()}")
 
