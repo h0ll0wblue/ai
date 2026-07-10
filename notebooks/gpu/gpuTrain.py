@@ -233,6 +233,7 @@ optimizer = nnx.Optimizer(
 )
 model, globalStep, tokensSeen = tryResume(model, optimizer)
 
+@nnx.remat
 def lossFn(m, batch):
     lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
