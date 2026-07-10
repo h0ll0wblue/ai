@@ -39,27 +39,12 @@ if not isGpu:
         f"GPU not available (found {nDevices} x {deviceKind})."
     )
 
-isMultiGpu = nDevices >= 2
-
 MICRO_BATCH_PER_CHIP = 1
-if nDevices == 1:
-    GRAD_ACCUM_STEPS = 128
-else:
-    GRAD_ACCUM_STEPS = 128
-
-N_CHIPS = nDevices if isMultiGpu else 1
+N_CHIPS = 1
+GRAD_ACCUM_STEPS = 128
 
 print(f"Devices: {nDevices} x {deviceKind}")
-print(f"Config: microBatch={MICRO_BATCH_PER_CHIP}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
-
-# ── Distributed Setup ─────────────────────────────────────────────────────────
-
-distCtx = None
-if isMultiGpu:
-    from jax.sharding import Mesh, PartitionSpec
-    mesh = Mesh(jax.devices(), ("devices",))
-    distCtx = nnx.Distributed(mesh, PartitionSpec())
-    distCtx.__enter__()
+print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -404,5 +389,4 @@ finally:
         print(f"  Average tok/s: {finalTokens / finalElapsed:,.0f}")
     print(f"{'='*60}")
 
-    if distCtx is not None:
-        distCtx.__exit__(None, None, None)
+    pass

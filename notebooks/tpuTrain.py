@@ -34,15 +34,7 @@ if not isTpu or nDevices < 8:
         f"TPU (8 chips) not available (found {nDevices} x {deviceKind})."
     )
 
-N_CHIPS = nDevices
-
-# ── Distributed Setup ─────────────────────────────────────────────────────────
-
-from jax.sharding import Mesh, PartitionSpec
-
-mesh = Mesh(jaxDevices, ("devices",))
-distCtx = nnx.Distributed(mesh, PartitionSpec())
-distCtx.__enter__()
+N_CHIPS = 1
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -392,4 +384,4 @@ finally:
         print(f"  Average tok/s: {finalTokens / finalElapsed:,.0f}")
     print(f"{'='*60}")
 
-    distCtx.__exit__(None, None, None)
+    pass
