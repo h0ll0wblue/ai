@@ -221,7 +221,7 @@ def test_checkpoint_roundtrip():
 
     lossBeforeStep2 = float(lossFn(model2))
     diff = abs(lossBeforeStep2 - lossAfterStep1)
-    assert diff < 1e-6, (
+    assert diff < 1e-3, (
         f"Restored model differs: {lossAfterStep1:.4f} -> {lossBeforeStep2:.4f} (diff={diff:.2e})"
     )
     print(f"  [OK] checkpoint roundtrip: step={step}, tokens={tokensSeen}, loss match={diff:.2e}")

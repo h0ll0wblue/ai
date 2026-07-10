@@ -20,12 +20,15 @@ def _arrays_to_lists(d):
     elif isinstance(d, (jnp.ndarray, np.ndarray)):
         arr = np.asarray(d)
         origDtype = str(arr.dtype)
+        storedDtype = origDtype
         if arr.dtype in (np.float32, np.float64):
             arr = arr.astype(np.float16)
+            storedDtype = "float16"
         return {
             "__ndarray__": True,
             "shape": list(d.shape),
             "dtype": origDtype,
+            "stored_dtype": storedDtype,
             "data": msgpack.dumps(arr.tobytes()),
         }
     return d
@@ -34,11 +37,15 @@ def _arrays_to_lists(d):
 def _lists_to_arrays(d):
     if isinstance(d, dict):
         if "__ndarray__" in d:
+            storedDtype = d.get("stored_dtype")
+            if storedDtype is None:
+                # Backwards compatibility fallback
+                storedDtype = "float16" if d["dtype"] in ("float32", "float64") else d["dtype"]
             arr = np.frombuffer(
-                msgpack.loads(d["data"]), dtype=np.float16
+                msgpack.loads(d["data"]), dtype=np.dtype(storedDtype)
             ).reshape(d["shape"])
             targetDtype = d["dtype"]
-            if targetDtype in ("float32", "float64"):
+            if str(arr.dtype) != targetDtype:
                 arr = arr.astype(targetDtype)
             return jnp.array(arr)
         return {k: _lists_to_arrays(v) for k, v in d.items()}
