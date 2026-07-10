@@ -391,16 +391,14 @@ def _make_device_batch(mb: dict) -> dict:
 
 try:
     while time.time() - startTime < SESH_DURATION:
-        # ── Gradient accumulation ─────────────────────────────────────────
-        # After each micro_step we call jax.block_until_ready(grads_accum).
-        # This forces XLA to finish the jnp.add and release the old gradient
-        # buffer before we dispatch the next forward+backward pass.
-        # Without this, async-queued gradient pytrees pile up in VRAM
-        # (128 × ~2.4 GB >> 15 GB → OOM).
-        # Each micro_step takes several seconds of compute on a T4, so the
-        # synchronisation overhead is negligible.
+        # ── Gradient accumulation on Host RAM ─────────────────────────────
+        # To avoid OOM, we do not accumulate gradients in GPU memory.
+        # Instead, after each micro_step, we transfer the gradients to host
+        # memory (CPU RAM, which has plenty of headroom: 30 GB vs 15 GB on GPU)
+        # using jax.device_get, accumulate them on CPU, and delete the GPU copy.
+        # This saves 2.4 GB of VRAM per GPU, preventing OOM.
         grads_accum = None
-        loss_accum  = 0.0   # plain Python float; float(loss) syncs a scalar cheaply
+        loss_accum  = 0.0   # plain Python float
 
         if step == globalStep:
             print(f"  [JIT] Compiling micro_step + apply_gradients "
@@ -409,18 +407,35 @@ try:
         for _ in range(GRAD_ACCUM_STEPS):
             batch = _make_device_batch(get_batch())
             loss, grads = micro_step(model, batch)
+            
             # Sync scalar to CPU first (tiny, fast; avoids sharding issues).
             loss_accum += float(loss)
-            # Accumulate gradients, then sync so old buffer can be freed.
+            
+            # Transfer grads to CPU and accumulate there to save GPU memory
+            grads_cpu = jax.device_get(grads)
             if grads_accum is None:
-                grads_accum = grads
+                grads_accum = grads_cpu
             else:
-                grads_accum = jax.tree.map(jnp.add, grads_accum, grads)
-            jax.block_until_ready(grads_accum)
-
-        avg_grads = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grads_accum)
+                # Accumulate on CPU
+                grads_accum = jax.tree.map(lambda x, y: x + y, grads_accum, grads_cpu)
+            
+            # Clean up device references immediately
+            del grads
+            
+        # Average on CPU
+        avg_grads_cpu = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grads_accum)
+        
+        # Move avg_grads back to GPU with appropriate sharding
+        if N_CHIPS > 1:
+            avg_grads = jax.device_put(avg_grads_cpu, model_sharding)
+        else:
+            avg_grads = jax.device_put(avg_grads_cpu)
+            
         apply_gradients(model, optimizer, avg_grads)
         jax.block_until_ready(nnx.state(model, nnx.Param))  # ensure update lands
+        
+        # Clean up CPU references
+        del grads_accum, avg_grads_cpu, avg_grads
 
         avg_loss = loss_accum / GRAD_ACCUM_STEPS
 
