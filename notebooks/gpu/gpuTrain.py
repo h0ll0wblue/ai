@@ -18,7 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
@@ -342,6 +343,17 @@ def computeLoss(model, batch):
 @nnx.jit
 def microBatchStep(model, batch):
     return nnx.value_and_grad(computeLoss)(model, batch)
+
+# Warmup JIT compilation with minimal input to avoid CPU OOM
+print("Compiling training step (this may take a minute)...")
+warmupIds = jnp.zeros((1, 1), dtype=jnp.int32)
+warmup = {
+    "inputIds": warmupIds,
+    "positions": jnp.zeros((1, 1), dtype=jnp.int32),
+    "targetIds": warmupIds,
+}
+_loss, _grads = microBatchStep(model, warmup)
+print("Compilation complete.")
 
 # ── Data Pipeline ──────────────────────────────────────────────────────────────
 
