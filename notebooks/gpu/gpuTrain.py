@@ -14,8 +14,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import mesh_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
@@ -27,15 +25,11 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if not any(d.platform == "gpu" for d in GPUS):
     sys.exit(f"No GPU found ({N_GPUS} x {GPU_KIND})")
 
-N_CHIPS = N_GPUS
+N_CHIPS = 1
 MICRO_BATCH_PER_CHIP = 1
 GRAD_ACCUM_STEPS = 128
 
-device_mesh = Mesh(mesh_utils.create_device_mesh((N_GPUS,)), ("data",))
-model_sharding = NamedSharding(device_mesh, PartitionSpec())
-data_sharding = NamedSharding(device_mesh, PartitionSpec("data"))
-
-print(f"Devices: {N_GPUS} x {GPU_KIND}")
+print(f"Device: {GPU_KIND}")
 print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -195,10 +189,7 @@ optimizer = nnx.Optimizer(
     ),
     wrt=nnx.Param,
 )
-state = nnx.state((model, optimizer))
-state = jax.device_put(state, model_sharding)
-nnx.update((model, optimizer), state)
-print(f"[model] Created + replicated ({time.time()-t0:.1f}s)")
+print(f"[model] Created ({time.time()-t0:.1f}s)")
 
 # ── Checkpoint Resume ───────────────────────────────────────────────────────
 
@@ -207,9 +198,6 @@ def tryResume():
     try:
         p = hf_hub_download(REPO_ID, CKPT_FILE, token=hfToken)
         gs, ts = deserializeCheckpoint(model, optimizer, Path(p).read_bytes())
-        state = nnx.state((model, optimizer))
-        state = jax.device_put(state, model_sharding)
-        nnx.update((model, optimizer), state)
         print(f"  Resumed step {gs} ({ts:,} tokens)")
     except Exception as e:
         print(f"  Fresh start ({e})")
@@ -220,9 +208,6 @@ def saveCheckpoint(gs, ts):
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"checkpoint-{gs}.msgpack"
     try:
-        state = nnx.state((model, optimizer))
-        state = jax.device_get(state)
-        nnx.update((model, optimizer), state)
         b = serializeCheckpoint(model, optimizer, gs, ts)
         p.write_bytes(b)
         nb = len(b)
@@ -238,13 +223,12 @@ globalStep, tokensSeen = tryResume()
 # ── JIT-Compiled Micro-Step ─────────────────────────────────────────────────
 
 @nnx.remat
-def lossFn(m, inputIds, positions, targetIds):
-    lg = m(inputIds, positions, enableDropout=False)
-    return optax.softmax_cross_entropy_with_integer_labels(lg, targetIds).mean()
+def lossFn(m, batch):
+    lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
+    return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
 
-@nnx.jit
-def microStep(model, inputIds, positions, targetIds):
-    return nnx.value_and_grad(lossFn)(model, inputIds, positions, targetIds)
+def microStep(model, batch):
+    return nnx.value_and_grad(lossFn)(model, batch)
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -276,18 +260,16 @@ try:
                 inpSeq.append(d["inputIds"])
                 tgtSeq.append(d["targetIds"])
 
-            inputIds = jnp.stack(inpSeq)
-            positions = jnp.broadcast_to(
-                jnp.arange(SEQ_LEN, dtype=jnp.int32),
-                (MICRO_BATCH_SIZE, SEQ_LEN),
-            )
-            targetIds = jnp.stack(tgtSeq)
+            batch = {
+                "inputIds": jnp.stack(inpSeq),
+                "positions": jnp.broadcast_to(
+                    jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                    (MICRO_BATCH_SIZE, SEQ_LEN),
+                ),
+                "targetIds": jnp.stack(tgtSeq),
+            }
 
-            inputIds, positions, targetIds = jax.device_put(
-                (inputIds, positions, targetIds), data_sharding
-            )
-
-            loss, grads = microStep(model, inputIds, positions, targetIds)
+            loss, grads = microStep(model, batch)
 
             gradAccum = grads if gradAccum is None else jax.tree.map(jnp.add, gradAccum, grads)
             lossAccum += float(loss)
