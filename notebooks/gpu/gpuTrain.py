@@ -233,7 +233,7 @@ def lossFn(m, batch):
     lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
 
-gradFn = nnx.value_and_grad(lossFn, wrt=nnx.Param)
+gradFn = nnx.value_and_grad(lossFn)
 
 print("First step will compile the backward pass (3-10 min)...")
 
