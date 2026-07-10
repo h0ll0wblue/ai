@@ -391,12 +391,16 @@ def _make_device_batch(mb: dict) -> dict:
 
 try:
     while time.time() - startTime < SESH_DURATION:
-        # ── Async gradient accumulation ──────────────────────────────────
-        # All micro_step dispatches are non-blocking (JAX/XLA async dispatch).
-        # jnp.add on grads is also async. We never call float() here.
-        # The ONLY host sync is float(loss_accum) after apply_gradients.
+        # ── Gradient accumulation ─────────────────────────────────────────
+        # After each micro_step we call jax.block_until_ready(grads_accum).
+        # This forces XLA to finish the jnp.add and release the old gradient
+        # buffer before we dispatch the next forward+backward pass.
+        # Without this, async-queued gradient pytrees pile up in VRAM
+        # (128 × ~2.4 GB >> 15 GB → OOM).
+        # Each micro_step takes several seconds of compute on a T4, so the
+        # synchronisation overhead is negligible.
         grads_accum = None
-        loss_accum  = jnp.zeros(())
+        loss_accum  = 0.0   # plain Python float; float(loss) syncs a scalar cheaply
 
         if step == globalStep:
             print(f"  [JIT] Compiling micro_step + apply_gradients "
@@ -405,17 +409,20 @@ try:
         for _ in range(GRAD_ACCUM_STEPS):
             batch = _make_device_batch(get_batch())
             loss, grads = micro_step(model, batch)
-            loss_accum  = loss_accum + loss                   # async on-device add
+            # Sync scalar to CPU first (tiny, fast; avoids sharding issues).
+            loss_accum += float(loss)
+            # Accumulate gradients, then sync so old buffer can be freed.
             if grads_accum is None:
                 grads_accum = grads
             else:
-                grads_accum = jax.tree.map(jnp.add, grads_accum, grads)  # async
+                grads_accum = jax.tree.map(jnp.add, grads_accum, grads)
+            jax.block_until_ready(grads_accum)
 
         avg_grads = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grads_accum)
         apply_gradients(model, optimizer, avg_grads)
+        jax.block_until_ready(nnx.state(model, nnx.Param))  # ensure update lands
 
-        # Single sync point per optimizer step
-        avg_loss = float(loss_accum) / GRAD_ACCUM_STEPS
+        avg_loss = loss_accum / GRAD_ACCUM_STEPS
 
         if np.isnan(avg_loss) or np.isinf(avg_loss):
             raise RuntimeError(f"Diverged at step {step + 1}: {avg_loss}")
