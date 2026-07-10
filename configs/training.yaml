@@ -1,0 +1,23 @@
+totalTokens: 12_000_000_000
+seqLen: 4096
+microBatchPerChip: 4
+nChips: 8
+gradAccumSteps: 8
+
+optimizer:
+  name: adamw
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+  weightDecay: 0.01
+  gradClipNorm: 1.0
+
+schedule:
+  peakLR: 3.0e-4
+  minLR: 3.0e-5
+  warmupFraction: 0.01
+  decay: cosine
+
+checkpoint:
+  intervalMinutes: 15
+  weightsRepo: "zephyros-600m"

@@ -1,0 +1,24 @@
+[project]
+name = "zephyros"
+version = "0.1.0"
+description = "A 600M parameter decoder-only language model trained from scratch"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.5.0,<1.0.0",
+    "jaxlib>=0.5.0,<1.0.0",
+    "flax>=0.10.0,<1.0.0",
+    "optax>=0.2.0,<1.0.0",
+    "datasets>=3.0.0,<4.0.0",
+    "tokenizers>=0.20.0,<1.0.0",
+    "huggingface-hub>=0.27.0,<1.0.0",
+    "pyyaml>=6.0,<7.0.0",
+    "msgpack>=1.0.0,<2.0.0",
+    "pytest>=9.0.0,<10.0.0",
+]
+
+[project.optional-dependencies]
+tpu = ["jax[tpu]>=0.5.0,<1.0.0"]
+gpu = ["jax[cuda12]>=0.5.0,<1.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]

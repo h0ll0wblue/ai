@@ -1,0 +1,8 @@
+vocabSize: 49152
+minFrequency: 2
+specialTokens:
+  pad: "[PAD]"
+  bos: "[BOS]"
+  eos: "[EOS]"
+pretokenizer:
+  individualDigits: true

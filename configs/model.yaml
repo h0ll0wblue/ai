@@ -1,0 +1,11 @@
+vocabSize: 49152
+dModel: 1280
+dFF: 4800
+nLayers: 24
+nQueryHeads: 20
+nKVHeads: 4
+headDim: 64
+maxSeqLen: 4096
+ropeTheta: 500000.0
+rmsNormEps: 1.0e-6
+tieEmbeddings: true
