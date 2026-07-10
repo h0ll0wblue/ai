@@ -16,19 +16,20 @@
 import os
 import sys
 import time
+import gc
 from pathlib import Path
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh, PartitionSpec
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
 
-# ── Device Detection ───────────────────────────────────────────────────────────
+# ── Device Detection & Mesh Setup ─────────────────────────────────────────────
 
 devices = jax.devices()
 nDevices = len(devices)
@@ -40,9 +41,14 @@ if not isGpu:
         f"GPU not available (found {nDevices} x {deviceKind})."
     )
 
+# Auto-detect: use all available GPUs for data parallelism
+N_CHIPS = nDevices
 MICRO_BATCH_PER_CHIP = 1
-N_CHIPS = 1
-GRAD_ACCUM_STEPS = 128
+GRAD_ACCUM_STEPS = 128  # Keeps stable: 2 GPUs -> 2x tokens/step -> 1.0M tok/step
+
+# Set up device mesh for data parallelism
+mesh = Mesh(jax.devices(), ("data",))
+nnx.spmd.set_mesh(mesh)
 
 print(f"Devices: {nDevices} x {deviceKind}")
 print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
@@ -344,16 +350,22 @@ def computeLoss(model, batch):
 def microBatchStep(model, batch):
     return nnx.value_and_grad(computeLoss)(model, batch)
 
-# Warmup JIT compilation with minimal input to avoid CPU OOM
-print("Compiling training step (this may take a minute)...")
-warmupIds = jnp.zeros((1, 1), dtype=jnp.int32)
+# JIT warmup with real shapes to avoid recompilation during training
+print("Compiling training step (may take a minute)...")
+warmupIds = jnp.zeros((MICRO_BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
 warmup = {
     "inputIds": warmupIds,
-    "positions": jnp.zeros((1, 1), dtype=jnp.int32),
+    "positions": jnp.broadcast_to(
+        jnp.arange(SEQ_LEN, dtype=jnp.int32),
+        (MICRO_BATCH_SIZE, SEQ_LEN),
+    ),
     "targetIds": warmupIds,
 }
 _loss, _grads = microBatchStep(model, warmup)
 print("Compilation complete.")
+
+gc.collect()
+jax.clear_caches()
 
 # ── Data Pipeline ──────────────────────────────────────────────────────────────
 
