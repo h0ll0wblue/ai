@@ -2,7 +2,7 @@
 # Zephyros-600M -- TPU pre-training runner
 # ---
 # Run this as a notebook with a TPU accelerator (8 chips expected).
-# Each session trains for 1 hour with checkpoints every 15 minutes.
+# Each session trains for 8 hours with checkpoints every 15 minutes.
 # Aborts if TPU is not available.
 #
 # Requires HF_TOKEN env var (set as platform Secret or local .env).
@@ -98,7 +98,7 @@ TOKENIZER_REPO = "h0ll0wpurple/zephyros-600m"
 
 def loadTokenizer():
     try:
-        path = hf_hub_download(TOKENIZER_REPO, "tokenizer.json")
+        path = hf_hub_download(TOKENIZER_REPO, "tokenizer.json", token=HF_TOKEN)
         return Tokenizer.from_file(path)
     except Exception:
         localPath = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
@@ -260,7 +260,7 @@ def makeDataPipeline(sessionSeed: int = 42):
     totalW = sum(loadedWeights)
     probs = [w / totalW for w in loadedWeights]
     combined = interleave_datasets(loaded, probabilities=probs)
-    combined = combined.shuffle(buffer_size=10_000, seed=sessionSeed)
+    combined = combined.shuffle(buffer_size=1000, seed=sessionSeed)
 
     def packAndBatch(iterator):
         buffer = []

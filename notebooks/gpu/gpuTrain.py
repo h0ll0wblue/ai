@@ -24,7 +24,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
@@ -405,7 +405,7 @@ def makeDataPipeline(sessionSeed: int = 42):
     totalW = sum(loadedWeights)
     probs = [w / totalW for w in loadedWeights]
     combined = interleave_datasets(loaded, probabilities=probs)
-    combined = combined.shuffle(buffer_size=10_000, seed=sessionSeed)
+    combined = combined.shuffle(buffer_size=1000, seed=sessionSeed)
 
     def packAndBatch(iterator):
         buffer = []
