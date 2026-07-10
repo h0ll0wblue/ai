@@ -40,7 +40,6 @@ from huggingface_hub import HfApi, hf_hub_download, create_repo
 
 # ── GPU Discovery ─────────────────────────────────────────────────────────────
 # Query BEFORE any JAX computation so all devices are initialised.
-# Use jax.devices("gpu") to only count actual CUDA devices.
 GPUS = jax.devices("gpu") if any(d.platform == "gpu" for d in jax.devices()) else []
 N_GPUS = len(GPUS)
 GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
@@ -48,22 +47,15 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if N_GPUS == 0:
     sys.exit(f"No GPU found. Devices: {jax.devices()}")
 
-# Default: use ALL visible GPUs (not just 2).
-REQUIRED_GPUS = int(os.environ.get("REQUIRED_GPUS", str(N_GPUS)))
-if REQUIRED_GPUS < 1:
-    sys.exit(f"REQUIRED_GPUS must be >= 1 (got {REQUIRED_GPUS})")
-if N_GPUS < REQUIRED_GPUS:
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<all>")
-    sys.exit(
-        f"Need {REQUIRED_GPUS} GPUs but JAX sees {N_GPUS}. "
-        f"CUDA_VISIBLE_DEVICES={visible}. Select a 2xT4 runtime or expose both GPUs."
-    )
-
-N_CHIPS = REQUIRED_GPUS
+# Force single-GPU training. Data-parallel replication doubles the 7.2 GB
+# model+optimizer onto EACH 15 GB T4, leaving <7.8 GB for activations +
+# gradients + XLA compilation workspace — not enough.
+# With 1 GPU we get the full 15 GB and avoid replication overhead entirely.
+N_CHIPS = 1
 ACTIVE_GPUS = GPUS[:N_CHIPS]
 print(
     f"JAX: {jax.__version__}  Flax: {flax.__version__}  "
-    f"Visible: {N_GPUS} x {GPU_KIND}  Active: {N_CHIPS} x {GPU_KIND}"
+    f"Visible: {N_GPUS} x {GPU_KIND}  Using: {N_CHIPS} x {GPU_KIND}"
 )
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -86,14 +78,12 @@ TRAINING_CONFIG = {
 
 SEQ_LEN = TRAINING_CONFIG["seqLen"]
 
-# Micro-batch per chip:
-#   - Set to 1 always to ensure the absolute minimum memory footprint.
-#   - At seqLen = 2048 and microBatch = 1, memory usage is halved, giving maximum headroom.
-MICRO_BATCH_PER_CHIP = 1
-GRAD_ACCUM_STEPS     = 512 if N_CHIPS == 1 else 256
-MICRO_BATCH_SIZE     = MICRO_BATCH_PER_CHIP * N_CHIPS  # total seqs per micro-step
+# Micro-batch: 1 sequence per step to minimize peak VRAM.
+# With seqLen=2048 and 512 accumulation steps → 1,048,576 tokens per optimizer step.
+MICRO_BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 512
 
-print(f"Config: microBatch={MICRO_BATCH_PER_CHIP}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
+print(f"Config: microBatch={MICRO_BATCH_SIZE}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
 
 class ModelConfig:
     def __init__(self, data):
@@ -111,20 +101,8 @@ DATASET_MIX: list[tuple[str, str | None, float]] = [
     ("open-web-math/open-web-math", "train", 0.05),
 ]
 
-# ── Mesh + Sharding Setup ───────────────────────────────────────────────────
-
-if N_CHIPS > 1:
-    mesh = jax.sharding.Mesh(
-        np.array(ACTIVE_GPUS), ("data",)
-    )
-    model_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    data_sharding = jax.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
-    print(f"Mesh: ({N_CHIPS},) on 'data' axis")
-else:
-    mesh = None
-    model_sharding = None
-    data_sharding = None
-    print("Single GPU: no sharding")
+# Single-GPU: no mesh or sharding needed.
+print("Single GPU: no sharding")
 
 # ── Quick Checks ────────────────────────────────────────────────────────────
 
@@ -197,7 +175,7 @@ dIter    = iter(combined)
 # ── Background tokeniser thread ───────────────────────────────────────────────
 # Keeps several steps of data pre-tokenised so the GPU never blocks on the CPU.
 
-_DATA_QUEUE_SIZE = GRAD_ACCUM_STEPS * 4  # keep several steps pre-fetched
+_DATA_QUEUE_SIZE = min(GRAD_ACCUM_STEPS, 256)  # cap prefetch to limit CPU RAM
 _data_queue: queue.Queue = queue.Queue(maxsize=_DATA_QUEUE_SIZE)
 _tok_buf: list[int] = []
 
@@ -277,31 +255,17 @@ optimizer = nnx.Optimizer(
     wrt=nnx.Param,
 )
 print(f"[model] Created ({time.time()-t0:.1f}s)")
-
-# ── Replicate State Across Devices (multi-GPU only) ─────────────────────────
-
-if N_CHIPS > 1:
-    print("[shard] Replicating model + optimizer state...")
-    state = nnx.state((model, optimizer))
-    state = jax.device_put(state, model_sharding)
-    nnx.update((model, optimizer), state)
-    print("  [OK] State replicated")
+gc.collect()  # free any temporary arrays from model/optimizer init
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
 def _dereplicate():
-    """Pull state back to a single host array before serialisation."""
-    if N_CHIPS > 1:
-        st = nnx.state((model, optimizer))
-        st = jax.device_get(st)
-        nnx.update((model, optimizer), st)
+    """No-op for single GPU (state is already on host-accessible device)."""
+    pass
 
 def _replicate():
-    """Push state back onto all devices after deserialisation."""
-    if N_CHIPS > 1:
-        st = nnx.state((model, optimizer))
-        st = jax.device_put(st, model_sharding)
-        nnx.update((model, optimizer), st)
+    """No-op for single GPU."""
+    pass
 
 # ── Checkpoint Resume ───────────────────────────────────────────────────────
 
@@ -382,8 +346,6 @@ print(f"Session: {SESH_DURATION}s  CKPT: {CKPT_INTERVAL}s")
 print(f"Resume: step {globalStep}  tokens {tokensSeen:,}")
 print(f"Micro-batch: {MICRO_BATCH_SIZE} seq ({MICRO_BATCH_SIZE * SEQ_LEN:,} tok/micro), "
       f"accum {GRAD_ACCUM_STEPS} -> {nTokensPerStep:,} tok/step")
-if mesh:
-    print(f"Mesh: {mesh.shape}")
 print(f"{'='*50}\n")
 
 step          = globalStep
@@ -393,11 +355,8 @@ sessionFailed = False
 nSamples      = 0
 
 def _make_device_batch(mb: dict) -> dict:
-    """Convert a numpy micro-batch dict to JAX arrays, sharded if multi-GPU."""
-    batch = {k: jnp.array(v) for k, v in mb.items()}
-    if N_CHIPS > 1:
-        batch = jax.device_put(batch, data_sharding)
-    return batch
+    """Convert a numpy micro-batch dict to JAX arrays on the default GPU."""
+    return {k: jnp.array(v) for k, v in mb.items()}
 
 try:
     while time.time() - startTime < SESH_DURATION:
@@ -436,10 +395,7 @@ try:
         avg_grads_cpu = jax.tree.map(lambda g: np.divide(g, GRAD_ACCUM_STEPS, out=g), grads_accum)
         
         # Move avg_grads back to GPU with appropriate sharding
-        if N_CHIPS > 1:
-            avg_grads = jax.device_put(avg_grads_cpu, model_sharding)
-        else:
-            avg_grads = jax.device_put(avg_grads_cpu)
+        avg_grads = jax.device_put(avg_grads_cpu)
             
         apply_gradients(model, optimizer, avg_grads)
         jax.block_until_ready(nnx.state(model, nnx.Param))  # ensure update lands
