@@ -238,13 +238,13 @@ globalStep, tokensSeen = tryResume()
 # ── JIT-Compiled Micro-Step ─────────────────────────────────────────────────
 
 @nnx.remat
-def lossFn(m, batch):
-    lg = m(batch["inputIds"], batch["positions"], enableDropout=False)
-    return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
+def lossFn(m, inputIds, positions, targetIds):
+    lg = m(inputIds, positions, enableDropout=False)
+    return optax.softmax_cross_entropy_with_integer_labels(lg, targetIds).mean()
 
 @nnx.jit
-def microStep(model, batch):
-    return nnx.value_and_grad(lossFn)(model, batch)
+def microStep(model, inputIds, positions, targetIds):
+    return nnx.value_and_grad(lossFn)(model, inputIds, positions, targetIds)
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -276,17 +276,18 @@ try:
                 inpSeq.append(d["inputIds"])
                 tgtSeq.append(d["targetIds"])
 
-            batch = {
-                "inputIds": jnp.stack(inpSeq),
-                "positions": jnp.broadcast_to(
-                    jnp.arange(SEQ_LEN, dtype=jnp.int32),
-                    (MICRO_BATCH_SIZE, SEQ_LEN),
-                ),
-                "targetIds": jnp.stack(tgtSeq),
-            }
-            batch = jax.device_put(batch, data_sharding)
+            inputIds = jnp.stack(inpSeq)
+            positions = jnp.broadcast_to(
+                jnp.arange(SEQ_LEN, dtype=jnp.int32),
+                (MICRO_BATCH_SIZE, SEQ_LEN),
+            )
+            targetIds = jnp.stack(tgtSeq)
 
-            loss, grads = microStep(model, batch)
+            inputIds, positions, targetIds = jax.device_put(
+                (inputIds, positions, targetIds), data_sharding
+            )
+
+            loss, grads = microStep(model, inputIds, positions, targetIds)
 
             gradAccum = grads if gradAccum is None else jax.tree.map(jnp.add, gradAccum, grads)
             lossAccum += float(loss)
