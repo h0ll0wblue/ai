@@ -11,8 +11,8 @@ def buildTokenizer():
     parser = argparse.ArgumentParser()
     parser.add_argument("--from-datasets", nargs="*", default=[],
         help="Train from HuggingFace datasets instead of local .txt files")
-    parser.add_argument("--sample", type=int, default=100000,
-        help="Number of examples to sample from each HF dataset for training")
+    parser.add_argument("--sample", type=int, default=5000,
+        help="Number of examples to sample from each HF dataset for training (5000 = ~10-20MB of text)")
     parser.add_argument("--output", type=str, default="tokenizer",
         help="Output directory")
     args = parser.parse_args()
@@ -58,17 +58,23 @@ def buildTokenizer():
             ds = load_dataset(name, split=split, streaming=True)
             textKey = "text" if "text" in ds.features else list(ds.features.keys())[0]
             texts = []
+            logInterval = max(1, args.sample // 10)
             for i, example in enumerate(ds):
                 if i >= args.sample:
                     break
                 texts.append(example[textKey])
+                if (i + 1) % logInterval == 0:
+                    print(f"    ... loaded {i+1}/{args.sample} examples")
             print(f"    Loaded {len(texts)} examples, saving to temp file...")
             tmpPath = f"/tmp/tokenizer-data-{name.replace('/', '-')}.txt"
             with open(tmpPath, "w", encoding="utf-8") as f:
                 for t in texts:
                     f.write(t + "\n")
             dataFiles.append(tmpPath)
+        print(f"  Starting BPE training on {len(dataFiles)} file(s)...")
+        print(f"  This may take several minutes with no visible progress.")
         tokenizer.train(trainer, dataFiles)
+        print(f"  BPE training complete!")
         for p in dataFiles:
             os.remove(p)
     else:
