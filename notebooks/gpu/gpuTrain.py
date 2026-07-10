@@ -18,6 +18,11 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 
+# Set Hugging Face cache directories to Kaggle disk instead of RAM (tmpfs /root)
+os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
+os.environ["HF_DATASETS_CACHE"] = "/kaggle/working/.cache/huggingface"
+
+
 import sys
 import time
 import queue
