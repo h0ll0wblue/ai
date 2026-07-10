@@ -20,7 +20,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
 import optax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
@@ -32,11 +31,9 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if not any(d.platform == "gpu" for d in GPUS):
     sys.exit(f"No GPU found ({N_GPUS} x {GPU_KIND})")
 
-N_CHIPS = N_GPUS
+N_CHIPS = 1
 MICRO_BATCH_PER_CHIP = 1
 GRAD_ACCUM_STEPS = 128
-mesh = Mesh(jax.devices(), ("data",))
-nnx.spmd.set_mesh(mesh)
 
 print(f"Devices: {N_GPUS} x {GPU_KIND}")
 print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
@@ -233,12 +230,15 @@ optimizer = nnx.Optimizer(
 )
 model, globalStep, tokensSeen = tryResume(model, optimizer)
 
+def lossFn(m, batch):
+    lg = m(batch["inputIds"], batch["positions"], enableDropout=True)
+    return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
+
+gradFn = nnx.value_and_grad(lossFn)
+
 @nnx.jit
-def trainStep(model, batch):
-    def lossFn(m):
-        lg = m(batch["inputIds"], batch["positions"], enableDropout=True)
-        return optax.softmax_cross_entropy_with_integer_labels(lg, batch["targetIds"]).mean()
-    return nnx.value_and_grad(lossFn)(model)
+def trainStep(m, batch):
+    return gradFn(m, batch)
 
 print("Compiling first training step (may take 3-10 min)...")
 
