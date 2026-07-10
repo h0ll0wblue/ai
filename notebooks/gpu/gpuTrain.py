@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import flax
 from flax import nnx
 from huggingface_hub import HfApi, hf_hub_download, create_repo
 
@@ -50,7 +51,7 @@ if N_GPUS < REQUIRED_GPUS:
 N_CHIPS = REQUIRED_GPUS
 ACTIVE_GPUS = GPUS[:N_CHIPS]
 print(
-    f"JAX: {jax.__version__}  Flax: {nnx.__version__}  "
+    f"JAX: {jax.__version__}  Flax: {flax.__version__}  "
     f"Visible: {N_GPUS} x {GPU_KIND}  Active: {N_CHIPS} x {GPU_KIND}"
 )
 
@@ -135,7 +136,6 @@ try:
 except Exception as e:
     sys.exit(f"Tokenizer: {e}")
 
-import flax
 print(f"  [OK] jax={jax.__version__} flax={flax.__version__} optax={optax.__version__}")
 
 HF_API = HfApi(token=hfToken)
