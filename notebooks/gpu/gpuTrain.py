@@ -19,7 +19,7 @@ import time
 import gc
 from pathlib import Path
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.70")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_enable_triton_gemm=false "
@@ -192,8 +192,9 @@ def preflightCheck():
         probeOpt = nnx.Optimizer(probeModel2, optax.adamw(3e-4), wrt=nnx.Param)
         _bytes = serializeCheckpoint(probeModel2, probeOpt, 0, 0)
         assert len(_bytes) > 0
-        print(f"  [OK] Checkpoint serialization works ({len(_bytes)} bytes)")
-        del probeModel2, probeOpt
+        nBytes = len(_bytes)
+        print(f"  [OK] Checkpoint serialization works ({nBytes} bytes)")
+        del probeModel2, probeOpt, _bytes
     except Exception as e:
         errors.append(f"Checkpoint I/O: {e}")
 
@@ -231,6 +232,11 @@ def preflightCheck():
     print(f"\n{'='*60}")
     print("All preflight checks passed — starting training")
     print(f"{'='*60}\n")
+
+    # Aggressive cleanup to free GPU/CPU memory before training
+    gc.collect()
+    jax.clear_caches()
+    nParams = None
 
 
 preflightCheck()
