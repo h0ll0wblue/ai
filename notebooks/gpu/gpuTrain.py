@@ -12,7 +12,12 @@
 #
 # NOTE: This file is intended to be uploaded to the Kaggle notebook and
 # run with:  !python gpuTrain.py
+# Set JAX memory variables before importing JAX to disable 90% pre-allocation,
+# allowing the XLA compiler to use system VRAM dynamically without OOMing.
 import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+
 import sys
 import time
 import queue
@@ -77,10 +82,10 @@ TRAINING_CONFIG = {
 SEQ_LEN = TRAINING_CONFIG["seqLen"]
 
 # Micro-batch per chip:
-#   - 2 micro-seqs on a single T4 (16 GB) with @nnx.remat is comfortable
-#   - 1 micro-seq per chip when using both T4s (each sees MICRO_BATCH_SIZE/N_CHIPS)
-MICRO_BATCH_PER_CHIP = 2 if N_CHIPS == 1 else 1
-GRAD_ACCUM_STEPS     = 64 if N_CHIPS == 1 else 128
+#   - 1 micro-seq per chip to fit 600M model in 15 GB T4 VRAM.
+#   - On single-GPU, we run 256 accumulation steps to keep the global batch size.
+MICRO_BATCH_PER_CHIP = 1
+GRAD_ACCUM_STEPS     = 256 if N_CHIPS == 1 else 128
 MICRO_BATCH_SIZE     = MICRO_BATCH_PER_CHIP * N_CHIPS  # total seqs per micro-step
 
 print(f"Config: microBatch={MICRO_BATCH_PER_CHIP}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
