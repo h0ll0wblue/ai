@@ -17,6 +17,7 @@ import sys
 import time
 import queue
 import threading
+import gc
 from pathlib import Path
 
 import jax
@@ -416,14 +417,14 @@ try:
             if grads_accum is None:
                 grads_accum = grads_cpu
             else:
-                # Accumulate on CPU
-                grads_accum = jax.tree.map(lambda x, y: x + y, grads_accum, grads_cpu)
+                # Accumulate on CPU in-place to avoid allocating new 2.4 GB arrays
+                jax.tree.map(lambda x, y: np.add(x, y, out=x), grads_accum, grads_cpu)
             
-            # Clean up device references immediately
-            del grads
+            # Clean up device and host references immediately
+            del grads, grads_cpu
             
-        # Average on CPU
-        avg_grads_cpu = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grads_accum)
+        # Average on CPU in-place
+        avg_grads_cpu = jax.tree.map(lambda g: np.divide(g, GRAD_ACCUM_STEPS, out=g), grads_accum)
         
         # Move avg_grads back to GPU with appropriate sharding
         if N_CHIPS > 1:
@@ -436,6 +437,7 @@ try:
         
         # Clean up CPU references
         del grads_accum, avg_grads_cpu, avg_grads
+        gc.collect()
 
         avg_loss = loss_accum / GRAD_ACCUM_STEPS
 
