@@ -74,7 +74,7 @@ TRAINING_CONFIG = {
     },
     "checkpoint": {
         "intervalMinutes": 15,
-        "weightsRepo": "zephyros-600m",
+        "weightsRepo": "h0ll0wpurple/zephyros-600m",
     },
 }
 
@@ -94,7 +94,7 @@ modelConfig = ModelConfig(MODEL_CONFIG)
 
 from tokenizers import Tokenizer
 
-TOKENIZER_REPO = "zephyros-600m"
+TOKENIZER_REPO = "h0ll0wpurple/zephyros-600m"
 
 def loadTokenizer():
     try:

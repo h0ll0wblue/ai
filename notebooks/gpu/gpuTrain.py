@@ -81,7 +81,7 @@ TRAINING_CONFIG = {
     },
     "checkpoint": {
         "intervalMinutes": 15,
-        "weightsRepo": "zephyros-600m",
+        "weightsRepo": "h0ll0wpurple/zephyros-600m",
     },
 }
 
@@ -231,11 +231,10 @@ preflightCheck()
 from tokenizers import Tokenizer
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-TOKENIZER_REPO = "zephyros-600m"
 
 def loadTokenizer():
     try:
-        path = hf_hub_download(TOKENIZER_REPO, "tokenizer.json", token=HF_TOKEN)
+        path = hf_hub_download(REPO_ID, "tokenizer.json", token=HF_TOKEN)
         return Tokenizer.from_file(path)
     except Exception:
         localPath = "/kaggle/input/zephyros-tokenizer/tokenizer.json"
