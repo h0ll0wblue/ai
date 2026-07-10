@@ -326,49 +326,41 @@ def saveCheckpoint(gs, ts):
 globalStep, tokensSeen = tryResume()
 
 # ── JIT-Compiled Training Step ──────────────────────────────────────────────
-# The ENTIRE gradient-accumulation loop lives inside a single @nnx.jit call:
-#   • ONE Python→XLA dispatch per optimizer step (not 128 round-trips).
-#   • Gradients stay on-device throughout — no CPU materialisation.
-#   • jax.lax.fori_loop drives the micro-step loop inside XLA.
+# Design: two small @nnx.jit functions instead of one monolithic one.
+#
+# WHY NOT fori_loop / lax.scan:
+#   NNX models carry stateful variables (RngCount, etc.) that live at the
+#   top-level JAX trace. lax control-flow primitives open a *new* trace level
+#   and cannot close over those variables → "Cannot extract graph node from
+#   different trace level" crash. They also require XLA to hold activations
+#   for ALL iterations simultaneously → OOM on 16 GB T4.
+#
+# WHAT WE DO INSTEAD:
+#   • micro_step: one @nnx.jit forward+backward per micro-batch.
+#     All 128 dispatches are ASYNC — JAX/XLA queues them without blocking
+#     Python. jnp.add on grads is also async.
+#   • apply_gradients: one @nnx.jit optimizer update.
+#   • float(loss_accum) at the very end is the ONLY host sync per step.
+#
+# Peak VRAM: 1 micro-batch activations (freed by remat) + full grad pytree.
 
 @nnx.remat
-def _loss_fn(model, batch_slice):
-    """Forward pass for one micro-batch slice; returns scalar loss."""
-    logits = model(
-        batch_slice["inputIds"],
-        batch_slice["positions"],
-        enableDropout=False,
-    )
+def _loss_fn(model, batch):
+    """Forward pass; returns scalar loss. @nnx.remat discards activations."""
+    logits = model(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(
-        logits, batch_slice["targetIds"]
+        logits, batch["targetIds"]
     ).mean()
 
 @nnx.jit
-def train_step(model, optimizer, batch):
-    """
-    Full optimizer step over `batch` shaped [GRAD_ACCUM_STEPS, MICRO_BATCH_SIZE, ...].
-    Accumulates gradients over the leading axis with lax.fori_loop on-device,
-    then calls optimizer.update once. Returns the mean loss (scalar).
-    """
-    def accum_body(i, carry):
-        grads_accum, loss_accum = carry
-        batch_slice = jax.tree.map(lambda x: x[i], batch)
-        loss, grads = nnx.value_and_grad(_loss_fn)(model, batch_slice)
-        grads_accum = jax.tree.map(jnp.add, grads_accum, grads)
-        loss_accum  = loss_accum + loss
-        return grads_accum, loss_accum
+def micro_step(model, batch):
+    """Grad for one micro-batch [MICRO_BATCH_SIZE, SEQ_LEN]. No optimizer update."""
+    return nnx.value_and_grad(_loss_fn)(model, batch)
 
-    init_grads = jax.tree.map(jnp.zeros_like, nnx.state(model, nnx.Param))
-    init_loss  = jnp.zeros(())
-
-    final_grads, total_loss = jax.lax.fori_loop(
-        0, GRAD_ACCUM_STEPS, accum_body, (init_grads, init_loss)
-    )
-
-    avg_grads = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, final_grads)
+@nnx.jit
+def apply_gradients(model, optimizer, avg_grads):
+    """Apply pre-averaged gradients. Separated so optimizer.update runs on-device."""
     optimizer.update(model, avg_grads)
-
-    return total_loss / GRAD_ACCUM_STEPS
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -390,41 +382,40 @@ startTime     = lastCkptTime = time.time()
 sessionFailed = False
 nSamples      = 0
 
+def _make_device_batch(mb: dict) -> dict:
+    """Convert a numpy micro-batch dict to JAX arrays, sharded if multi-GPU."""
+    batch = {k: jnp.array(v) for k, v in mb.items()}
+    if N_CHIPS > 1:
+        batch = jax.device_put(batch, data_sharding)
+    return batch
+
 try:
     while time.time() - startTime < SESH_DURATION:
-        # Build stacked batch: [GRAD_ACCUM_STEPS, MICRO_BATCH_SIZE, SEQ_LEN]
-        # XLA loops over the first axis with lax.fori_loop — no Python loop at
-        # runtime after the first step compiles.
-        accum_inp = []
-        accum_tgt = []
-        accum_pos = []
-        for _ in range(GRAD_ACCUM_STEPS):
-            mb = get_batch()
-            accum_inp.append(mb["inputIds"])
-            accum_tgt.append(mb["targetIds"])
-            accum_pos.append(mb["positions"])
-
-        big_batch = {
-            "inputIds":  jnp.array(np.stack(accum_inp)),   # [G, B, S]
-            "targetIds": jnp.array(np.stack(accum_tgt)),   # [G, B, S]
-            "positions": jnp.array(np.stack(accum_pos)),   # [G, B, S]
-        }
-
-        # Shard the batch across chips (each chip gets B//N_CHIPS seqs per micro-step)
-        if N_CHIPS > 1:
-            def _shard_mb(x):
-                G, B, *rest = x.shape
-                return jax.device_put(
-                    x.reshape(G, N_CHIPS, B // N_CHIPS, *rest),
-                    jax.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "data"))
-                )
-            big_batch = jax.tree.map(_shard_mb, big_batch)
+        # ── Async gradient accumulation ──────────────────────────────────
+        # All micro_step dispatches are non-blocking (JAX/XLA async dispatch).
+        # jnp.add on grads is also async. We never call float() here.
+        # The ONLY host sync is float(loss_accum) after apply_gradients.
+        grads_accum = None
+        loss_accum  = jnp.zeros(())
 
         if step == globalStep:
-            print("  [JIT] Compiling train_step (first step ~30-120s)...", flush=True)
+            print(f"  [JIT] Compiling micro_step + apply_gradients "
+                  f"(first step ~60-180s)...", flush=True)
 
-        avg_loss = train_step(model, optimizer, big_batch)
-        avg_loss = float(avg_loss)
+        for _ in range(GRAD_ACCUM_STEPS):
+            batch = _make_device_batch(get_batch())
+            loss, grads = micro_step(model, batch)
+            loss_accum  = loss_accum + loss                   # async on-device add
+            if grads_accum is None:
+                grads_accum = grads
+            else:
+                grads_accum = jax.tree.map(jnp.add, grads_accum, grads)  # async
+
+        avg_grads = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grads_accum)
+        apply_gradients(model, optimizer, avg_grads)
+
+        # Single sync point per optimizer step
+        avg_loss = float(loss_accum) / GRAD_ACCUM_STEPS
 
         if np.isnan(avg_loss) or np.isinf(avg_loss):
             raise RuntimeError(f"Diverged at step {step + 1}: {avg_loss}")
