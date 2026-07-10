@@ -21,6 +21,11 @@ from pathlib import Path
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.80")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ["XLA_FLAGS"] = (
+    "--xla_dump_to=/dev/null "
+    "--xla_gpu_enable_triton_gemm=false "
+    "--xla_gpu_enable_cudnn_fmha=false"
+)
 
 import jax
 import jax.numpy as jnp
@@ -338,37 +343,18 @@ optimizer = nnx.Optimizer(
 
 model, globalStep, tokensSeen = tryResume(model, optimizer)
 
-# ── Gradient-Checkpointed Loss ────────────────────────────────────────────────
-
-@nnx.remat
-def computeLoss(model, batch):
-    logits = model(batch["inputIds"], batch["positions"], enableDropout=True)
-    return optax.softmax_cross_entropy_with_integer_labels(
-        logits, batch["targetIds"]
-    ).mean()
-
-# ── JIT-Wrapped Micro-Batch Step ──────────────────────────────────────────────
+# ── JIT-Compiled Training Step ───────────────────────────────────────────────
 
 @nnx.jit
-def microBatchStep(model, batch):
-    return nnx.value_and_grad(computeLoss)(model, batch)
+def trainStep(model, batch):
+    def lossFn(m):
+        logits = m(batch["inputIds"], batch["positions"], enableDropout=True)
+        return optax.softmax_cross_entropy_with_integer_labels(
+            logits, batch["targetIds"]
+        ).mean()
+    return nnx.value_and_grad(lossFn)(model)
 
-# JIT warmup with real shapes to avoid recompilation during training
-print("Compiling training step (may take a minute)...")
-warmupIds = jnp.zeros((MICRO_BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
-warmup = {
-    "inputIds": warmupIds,
-    "positions": jnp.broadcast_to(
-        jnp.arange(SEQ_LEN, dtype=jnp.int32),
-        (MICRO_BATCH_SIZE, SEQ_LEN),
-    ),
-    "targetIds": warmupIds,
-}
-_loss, _grads = microBatchStep(model, warmup)
-print("Compilation complete.")
-
-gc.collect()
-jax.clear_caches()
+print("Compiling training step (first step will be slow)...")
 
 # ── Data Pipeline ──────────────────────────────────────────────────────────────
 
@@ -471,7 +457,7 @@ try:
                 "targetIds": jnp.stack(batchTargets),
             }
 
-            loss, grads = microBatchStep(model, batch)
+            loss, grads = trainStep(model, batch)
 
             if gradsAccum is None:
                 gradsAccum = grads
