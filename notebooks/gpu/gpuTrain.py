@@ -99,13 +99,11 @@ REPO_ID = TRAINING_CONFIG["checkpoint"]["weightsRepo"]
 CKPT_FILE = "checkpoint.msgpack"
 
 DATASET_MIX: list[tuple[str, str | None, float]] = [
-    ("HuggingFaceFW/fineweb", "train", 0.60),
-    ("emozilla/pg19", "train", 0.15),
-    ("bookcorpus2", None, 0.10),
-    ("AI-MO/NuminaMath-CoT", None, 0.05),
+    ("HuggingFaceFW/fineweb", "train", 0.65),
+    ("emozilla/pg19", "train", 0.20),
+    ("AI-MO/NuminaMath-CoT", None, 0.07),
     ("open-web-math/open-web-math", "train", 0.05),
-    ("wikipedia", "20231101.en", 0.03),
-    ("CShorten/arxiv-abs", "train", 0.02),
+    ("HuggingFaceTB/smollm-corpus", "corpus", 0.03),
 ]
 
 # ── Preflight Checks ──────────────────────────────────────────────────────────
