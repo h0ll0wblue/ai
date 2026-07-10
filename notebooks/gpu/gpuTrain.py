@@ -187,7 +187,6 @@ if not allDs:
 
 probs    = [w / sum(w for _, _, w in allDs) for _, _, w in allDs]
 combined = interleave_datasets([d for d, _, _ in allDs], probabilities=probs)
-combined = combined.shuffle(buffer_size=1000, seed=42)
 dIter    = iter(combined)
 
 # ── Background tokeniser thread ───────────────────────────────────────────────
