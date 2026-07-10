@@ -277,24 +277,27 @@ def tryResume(model, optimizer):
 
 
 def saveCheckpoint(model, optimizer, globalStep, tokensSeen):
-    ckptBytes = serializeCheckpoint(model, optimizer, globalStep, tokensSeen)
-    try:
-        HF_API.upload_file(
-            path_or_fileobj=ckptBytes,
-            path_in_repo=CKPT_FILE,
-            repo_id=REPO_ID,
-        )
-        print(f"  Checkpoint saved to Hub (step {globalStep})")
-    except Exception as e:
-        print(f"  [WARN] Hub upload failed: {e}")
     localDirObj = Path("/kaggle/working/checkpoints")
     localDirObj.mkdir(parents=True, exist_ok=True)
     localPath = localDirObj / f"checkpoint-{globalStep}.msgpack"
     try:
+        ckptBytes = serializeCheckpoint(model, optimizer, globalStep, tokensSeen)
         localPath.write_bytes(ckptBytes)
-        print(f"  Local backup saved ({localPath})")
+        nBytes = len(ckptBytes)
+        del ckptBytes
+        print(f"  Local checkpoint saved ({localPath}, {nBytes // 1024**2} MB)")
     except Exception as e:
         print(f"  [WARN] Local save failed: {e}")
+        return
+    try:
+        HF_API.upload_file(
+            path_or_fileobj=str(localPath),
+            path_in_repo=CKPT_FILE,
+            repo_id=REPO_ID,
+        )
+        print(f"  Uploaded to Hub (step {globalStep})")
+    except Exception as e:
+        print(f"  [WARN] Hub upload failed: {e}")
 
 
 # ── Training Setup ────────────────────────────────────────────────────────────
