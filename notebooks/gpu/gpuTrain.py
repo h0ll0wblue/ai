@@ -82,10 +82,10 @@ TRAINING_CONFIG = {
 SEQ_LEN = TRAINING_CONFIG["seqLen"]
 
 # Micro-batch per chip:
-#   - 2 micro-seqs per chip at 2048 sequence length fits comfortably.
-#   - We keep the same tokens per step (1,048,576) by keeping GRAD_ACCUM_STEPS at 256 for single-GPU and 128 for dual-GPU.
-MICRO_BATCH_PER_CHIP = 2
-GRAD_ACCUM_STEPS     = 256 if N_CHIPS == 1 else 128
+#   - Set to 1 always to ensure the absolute minimum memory footprint.
+#   - At seqLen = 2048 and microBatch = 1, memory usage is halved, giving maximum headroom.
+MICRO_BATCH_PER_CHIP = 1
+GRAD_ACCUM_STEPS     = 512 if N_CHIPS == 1 else 256
 MICRO_BATCH_SIZE     = MICRO_BATCH_PER_CHIP * N_CHIPS  # total seqs per micro-step
 
 print(f"Config: microBatch={MICRO_BATCH_PER_CHIP}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
