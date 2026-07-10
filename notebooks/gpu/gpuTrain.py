@@ -161,7 +161,7 @@ while len(buf) < SEQ_LEN * 2:
 print(f"{len(buf)} tokens ({time.time()-t0:.1f}s)")
 
 def dataGen():
-    nonlocal buf, dIter
+    global buf, dIter
     while True:
         if len(buf) < SEQ_LEN:
             ex = next(dIter)
