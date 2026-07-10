@@ -65,12 +65,12 @@ print(
 
 MODEL_CONFIG = {
     "vocabSize": 49152, "dModel": 1280, "dFF": 4800, "nLayers": 24,
-    "nQueryHeads": 20, "nKVHeads": 4, "headDim": 64, "maxSeqLen": 4096,
+    "nQueryHeads": 20, "nKVHeads": 4, "headDim": 64, "maxSeqLen": 2048,
     "ropeTheta": 500000.0, "rmsNormEps": 1e-6, "tieEmbeddings": True,
     "remat": True,
 }
 TRAINING_CONFIG = {
-    "totalTokens": 12_000_000_000, "seqLen": 4096,
+    "totalTokens": 12_000_000_000, "seqLen": 2048,
     "optimizer": {"name": "adamw", "beta1": 0.9, "beta2": 0.95,
                   "epsilon": 1e-8, "weightDecay": 0.01, "gradClipNorm": 1.0},
     "schedule": {"peakLR": 3e-4, "minLR": 3e-5,
@@ -82,9 +82,9 @@ TRAINING_CONFIG = {
 SEQ_LEN = TRAINING_CONFIG["seqLen"]
 
 # Micro-batch per chip:
-#   - 1 micro-seq per chip to fit 600M model in 15 GB T4 VRAM.
-#   - On single-GPU, we run 256 accumulation steps to keep the global batch size.
-MICRO_BATCH_PER_CHIP = 1
+#   - 2 micro-seqs per chip at 2048 sequence length fits comfortably.
+#   - We keep the same tokens per step (1,048,576) by keeping GRAD_ACCUM_STEPS at 256 for single-GPU and 128 for dual-GPU.
+MICRO_BATCH_PER_CHIP = 2
 GRAD_ACCUM_STEPS     = 256 if N_CHIPS == 1 else 128
 MICRO_BATCH_SIZE     = MICRO_BATCH_PER_CHIP * N_CHIPS  # total seqs per micro-step
 
