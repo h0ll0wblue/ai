@@ -16,7 +16,8 @@
 import os, sys, time, gc
 from pathlib import Path
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
 
 import jax
 import jax.numpy as jnp
@@ -35,9 +36,8 @@ if not any(d.platform == "gpu" for d in GPUS):
 N_CHIPS = N_GPUS
 MICRO_BATCH_PER_CHIP = 1
 GRAD_ACCUM_STEPS = 128
-
-mesh = Mesh(jax.devices(), ("data",))
-nnx.spmd.set_mesh(mesh)
+Mesh(jax.devices(), ("data",))
+nnx.spmd.set_mesh(Mesh(jax.devices(), ("data",)))
 
 print(f"Devices: {N_GPUS} x {GPU_KIND}")
 print(f"Config: microBatch=1, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
