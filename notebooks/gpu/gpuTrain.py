@@ -114,7 +114,7 @@ DATASET_MIX: list[tuple[str, str | None, float]] = [
     ("emozilla/pg19", "train", 0.20),
     ("AI-MO/NuminaMath-CoT", None, 0.07),
     ("open-web-math/open-web-math", "train", 0.05),
-    ("HuggingFaceTB/smollm-corpus", "corpus", 0.03),
+    ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 0.03),
 ]
 
 # ── Preflight Checks ──────────────────────────────────────────────────────────
