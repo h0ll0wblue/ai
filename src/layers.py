@@ -65,14 +65,12 @@ class GroupedQueryAttention(nnx.Module):
         self.nHeads = nHeads
         self.nKVHeads = nKVHeads
         self.headDim = headDim
-        self.scale = headDim ** -0.5
         self.attnDropout = attnDropout
 
-        kKey, qKey, vKey, oKey = jax.random.split(rngs(), 4)
+        _, qKey, oKey = jax.random.split(rngs(), 3)
 
-        self.qProj = nnx.Linear(dModel, nHeads * headDim, use_bias=False, rngs=nnx.Rngs(qKey))
-        self.kProj = nnx.Linear(dModel, nKVHeads * headDim, use_bias=False, rngs=nnx.Rngs(kKey))
-        self.vProj = nnx.Linear(dModel, nKVHeads * headDim, use_bias=False, rngs=nnx.Rngs(vKey))
+        qkvDim = nHeads * headDim + 2 * nKVHeads * headDim
+        self.qkvProj = nnx.Linear(dModel, qkvDim, use_bias=False, rngs=nnx.Rngs(qKey))
         self.outProj = nnx.Linear(nHeads * headDim, dModel, use_bias=False, rngs=nnx.Rngs(oKey))
 
         self.rope = RotaryPositionEncoding(headDim, maxSeqLen, ropeTheta)
@@ -80,50 +78,32 @@ class GroupedQueryAttention(nnx.Module):
 
     def __call__(self, x: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         B, S, _ = x.shape
-        origDtype = x.dtype
 
-        q = self.qProj(x).reshape(B, S, self.nHeads, self.headDim)
-        k = self.kProj(x).reshape(B, S, self.nKVHeads, self.headDim)
-        v = self.vProj(x).reshape(B, S, self.nKVHeads, self.headDim)
+        qkv = self.qkvProj(x)
+        q, k, v = jnp.split(
+            qkv,
+            [self.nHeads * self.headDim, (self.nHeads + self.nKVHeads) * self.headDim],
+            axis=-1,
+        )
+
+        q = q.reshape(B, S, self.nHeads, self.headDim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, S, self.nKVHeads, self.headDim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, S, self.nKVHeads, self.headDim).transpose(0, 2, 1, 3)
+
+        q, k = self.rope(q, k, positions)
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        q, k = self.rope(q, k, positions)
-
-        nGroups = self.nHeads // self.nKVHeads
-        q = q.reshape(B, self.nKVHeads, nGroups, S, self.headDim)
-        k = k[:, :, None, :, :]
-        v = v[:, :, None, :, :]
-
-        # ── Attention in float16 to halve S×S matrix memory ──────────────
-        # scores/weights are [B, nKV, nGroups, S, S] = [1,4,5,4096,4096].
-        # In f32 each is 1.34 GB; in f16 each is 0.67 GB.
-        # During backward, 3 copies coexist (scores, weights, d_scores):
-        #   f32: 3 × 1.34 = 4.0 GB → OOM on 15 GB T4
-        #   f16: 3 × 0.67 = 2.0 GB → fits comfortably
-        q = q.astype(jnp.float16)
-        k = k.astype(jnp.float16)
-
-        scores = jnp.einsum("bngsd,bnGtd->bngst", q, k) * self.scale
-
-        mask = jnp.triu(jnp.full((S, S), jnp.finfo(jnp.float16).min, dtype=jnp.float16), k=1)
-        scores = scores + mask
-
-        # Softmax in float32 for numerical stability, then back to float16
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(jnp.float16)
+        output = jax.nn.dot_product_attention(
+            q, k, v, is_causal=True, implementation="xla"
+        )
 
         if enableDropout and self.attnDropout > 0.0:
-            weights = self.attnDropoutLayer(weights, deterministic=False)
+            output = self.attnDropoutLayer(output, deterministic=False)
 
-        v = v.astype(jnp.float16)
-        output = jnp.einsum("bngst,bnGtd->bngsd", weights, v)
-
-        # Cast back to original dtype for output projection
-        output = output.astype(origDtype)
-        output = output.reshape(B, self.nHeads, S, self.headDim)
-        output = output.transpose(0, 2, 1, 3).reshape(B, S, self.nHeads * self.headDim)
+        output = output.reshape(B, S, self.nHeads * self.headDim)
         return self.outProj(output)
 
 

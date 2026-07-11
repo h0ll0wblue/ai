@@ -21,7 +21,7 @@ class DecoderOnlyLM(nnx.Module):
         embedKey, layersKey = jax.random.split(baseKey)
 
         self.attnDropout = getattr(config, "attnDropout", 0.0)
-        self.remat = getattr(config, "remat", False)
+        self.tieEmbeddings = getattr(config, "tieEmbeddings", True)
 
         self.tokenEmbed = TokenEmbedding(
             config.vocabSize, config.dModel,
@@ -30,29 +30,44 @@ class DecoderOnlyLM(nnx.Module):
 
         self.nLayers = config.nLayers
         layerKeys = jax.random.split(layersKey, config.nLayers)
-        
-        for i in range(config.nLayers):
-            setattr(self, f"block_{i}",
-                TransformerBlock(
-                    config.dModel, config.dFF,
-                    config.nQueryHeads, config.nKVHeads,
-                    config.headDim, config.maxSeqLen,
-                    config.ropeTheta, config.rmsNormEps,
-                    rngs=nnx.Rngs(layerKeys[i]),
-                    attnDropout=self.attnDropout,
-                )
+
+        self.blocks = nnx.List([
+            TransformerBlock(
+                config.dModel, config.dFF,
+                config.nQueryHeads, config.nKVHeads,
+                config.headDim, config.maxSeqLen,
+                config.ropeTheta, config.rmsNormEps,
+                rngs=nnx.Rngs(layerKeys[i]),
+                attnDropout=self.attnDropout,
             )
+            for i in range(config.nLayers)
+        ])
+
+        self._scan_fn = nnx.scan(
+            self._block_fn,
+            in_axes=(nnx.Carry, None, None),
+            out_axes=nnx.Carry,
+            length=config.nLayers,
+            unroll=2,
+        )
 
         self.finalNorm = RmsNorm(config.dModel, config.rmsNormEps)
 
+        if not self.tieEmbeddings:
+            self.outputProj = nnx.Linear(
+                config.dModel, config.vocabSize, use_bias=False,
+                rngs=nnx.Rngs(rngs()),
+            )
+
+    def _block_fn(self, x, positions, enableDropout):
+        return self.blocks(x, positions, enableDropout=enableDropout)
+
     def __call__(self, inputIds: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         x = self.tokenEmbed(inputIds)
-        for i in range(self.nLayers):
-            block = getattr(self, f"block_{i}")
-            if self.remat:
-                x = nnx.remat(TransformerBlock.__call__, static_argnums=3)(block, x, positions, enableDropout)
-            else:
-                x = block(x, positions, enableDropout=enableDropout)
+        x = self._scan_fn(x, positions, enableDropout)
         x = self.finalNorm(x)
-        logits = x @ self.tokenEmbed.weight.T
+        if self.tieEmbeddings:
+            logits = x @ self.tokenEmbed.weight.T
+        else:
+            logits = self.outputProj(x)
         return logits

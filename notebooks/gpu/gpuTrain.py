@@ -22,15 +22,33 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
 os.environ["HF_DATASETS_CACHE"] = "/kaggle/working/.cache/huggingface"
 
+# Enable bf16 matmul precision for Tensor Cores on T4 (65 TFLOPS vs 8 TFLOPS fp32).
+# This disables the manual float16 casts in layers.py (which risk overflow in q·k
+# einsum) and instead rounds inputs to bf16 with fp32 accumulation, safe from overflow.
+os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "bfloat16"
+
+# Cache XLA compiled binaries across Kaggle sessions, saving ~60s recompilation
+# on resume. Persists on /kaggle/working disk.
+os.environ["JAX_COMPILATION_CACHE_DIR"] = "/kaggle/working/.cache/jax"
+
+# XLA GPU flags: fuse softmax with attention matmul via Triton, overlap compute
+# with memory via latency-hiding scheduler, enable async collectives for multi-GPU.
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_enable_triton_softmax_fusion=true "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_enable_async_all_gather=true "
+    "--xla_gpu_all_reduce_combine_threshold_bytes=1073741824"
+)
+
 
 import sys
 import time
-import queue
-import threading
+import multiprocessing as mp
 import gc
 from pathlib import Path
 
 import jax
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -47,15 +65,19 @@ GPU_KIND = GPUS[0].device_kind if N_GPUS > 0 else "cpu"
 if N_GPUS == 0:
     sys.exit(f"No GPU found. Devices: {jax.devices()}")
 
-# Force single-GPU training. Data-parallel replication doubles the 7.2 GB
-# model+optimizer onto EACH 15 GB T4, leaving <7.8 GB for activations +
-# gradients + XLA compilation workspace — not enough.
-# With 1 GPU we get the full 15 GB and avoid replication overhead entirely.
-N_CHIPS = 1
+# Use ALL available GPUs. With bf16 + on-device accum the replicated
+# model+optimizer (~7.2 GB) fits in 15 GB alongside activations.
+N_CHIPS = N_GPUS
 ACTIVE_GPUS = GPUS[:N_CHIPS]
 print(
     f"JAX: {jax.__version__}  Flax: {flax.__version__}  "
     f"Visible: {N_GPUS} x {GPU_KIND}  Using: {N_CHIPS} x {GPU_KIND}"
+)
+
+# Data-parallel mesh: replicate everything, shard the batch dimension
+mesh = jax.sharding.Mesh(jax.devices(), axis_names=("batch",))
+DATA_SHARDED = jax.sharding.NamedSharding(
+    mesh, jax.sharding.PartitionSpec("batch")
 )
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -64,7 +86,6 @@ MODEL_CONFIG = {
     "vocabSize": 49152, "dModel": 1280, "dFF": 4800, "nLayers": 24,
     "nQueryHeads": 20, "nKVHeads": 4, "headDim": 64, "maxSeqLen": 2048,
     "ropeTheta": 500000.0, "rmsNormEps": 1e-6, "tieEmbeddings": True,
-    "remat": True,
 }
 TRAINING_CONFIG = {
     "totalTokens": 12_000_000_000, "seqLen": 2048,
@@ -78,10 +99,10 @@ TRAINING_CONFIG = {
 
 SEQ_LEN = TRAINING_CONFIG["seqLen"]
 
-# Micro-batch: 1 sequence per step to minimize peak VRAM.
-# With seqLen=2048 and 512 accumulation steps → 1,048,576 tokens per optimizer step.
-MICRO_BATCH_SIZE = 1
-GRAD_ACCUM_STEPS = 512
+# With bf16 + on-device accum + remat, 4 seq/GPU fits in 15 GB.
+# 4 seq × N_GPUS × 2048 × 32 accum = 524 288 tok/step for 2× T4.
+MICRO_BATCH_SIZE = 4
+GRAD_ACCUM_STEPS = 32
 
 print(f"Config: microBatch={MICRO_BATCH_SIZE}, nChips={N_CHIPS}, gradAccum={GRAD_ACCUM_STEPS}")
 
@@ -101,8 +122,7 @@ DATASET_MIX: list[tuple[str, str | None, float]] = [
     ("open-web-math/open-web-math", "train", 0.05),
 ]
 
-# Single-GPU: no mesh or sharding needed.
-print("Single GPU: no sharding")
+
 
 # ── Quick Checks ────────────────────────────────────────────────────────────
 
@@ -122,7 +142,14 @@ try:
     path = hf_hub_download(REPO_ID, "tokenizer.json", token=hfToken)
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(path)
-    print(f"  [OK] Tokenizer (vocab {tokenizer.get_vocab_size()})")
+    # Determine EOS token ID for document separation in packing
+    EOS_ID = 0
+    for eos_candidate in ["<|endoftext|>", "[EOS]", "</s>", "<eos>", "[eos]"]:
+        tid = tokenizer.token_to_id(eos_candidate)
+        if tid is not None:
+            EOS_ID = tid
+            break
+    print(f"  [OK] Tokenizer (vocab {tokenizer.get_vocab_size()}, EOS={EOS_ID})")
 except Exception as e:
     sys.exit(f"Tokenizer: {e}")
 
@@ -132,7 +159,7 @@ HF_API = HfApi(token=hfToken)
 
 # ── Training Setup ──────────────────────────────────────────────────────────
 
-nTokensPerStep = MICRO_BATCH_SIZE * SEQ_LEN * GRAD_ACCUM_STEPS
+nTokensPerStep = MICRO_BATCH_SIZE * N_GPUS * SEQ_LEN * GRAD_ACCUM_STEPS
 nTotalSteps = TRAINING_CONFIG["totalTokens"] // nTokensPerStep
 nWarmupSteps = max(1, int(nTotalSteps * TRAINING_CONFIG["schedule"]["warmupFraction"]))
 nDecaySteps = nTotalSteps - nWarmupSteps
@@ -172,60 +199,69 @@ probs    = [w / sum(w for _, _, w in allDs) for _, _, w in allDs]
 combined = interleave_datasets([d for d, _, _ in allDs], probabilities=probs)
 dIter    = iter(combined)
 
-# ── Background tokeniser thread ───────────────────────────────────────────────
-# Keeps several steps of data pre-tokenised so the GPU never blocks on the CPU.
+# ── Background tokeniser processes ────────────────────────────────────────────
+# Multiple processes keep the GPU fed. Each has its own iterator so they
+# consume the dataset mix independently. On Linux (Kaggle), fork handles
+# the global state (tokenizer, allDs, combined) without pickling overhead.
 
-_DATA_QUEUE_SIZE = min(GRAD_ACCUM_STEPS, 256)  # cap prefetch to limit CPU RAM
-_data_queue: queue.Queue = queue.Queue(maxsize=_DATA_QUEUE_SIZE)
-_tok_buf: list[int] = []
+_N_TOK_WORKERS = 4
+_DATA_QUEUE: mp.Queue = mp.Queue(maxsize=1000)
 
-def _tokeniser_worker():
-    """Runs forever: tokenises documents and pushes (inp, tgt) pairs to queue."""
-    global _tok_buf
-    local_iter = dIter
+def _tokeniser_worker_proc(worker_id: int):
+    """Process worker: pull from dataset mix, tokenize, push to shared queue."""
+    buf: list[int] = []
+    local_iter = iter(combined)
     while True:
-        # Refill buffer until we have at least SEQ_LEN+1 tokens (inp + tgt)
-        while len(_tok_buf) < SEQ_LEN + 1:
-            try:
-                ex = next(local_iter)
-            except StopIteration:
-                local_iter = iter(combined)
-                ex = next(local_iter)
+        try:
+            while len(buf) < SEQ_LEN + 1:
+                try:
+                    ex = next(local_iter)
+                except StopIteration:
+                    local_iter = iter(combined)
+                    ex = next(local_iter)
 
-            text = None
-            for _, key, _ in allDs:
-                if key in ex:
-                    text = ex[key]
-                    break
-            if text is None:
-                text = ex.get("text") or ex.get("content") or list(ex.values())[0]
-            if isinstance(text, str):
-                _tok_buf.extend(tokenizer.encode(text).ids)
+                text = None
+                for _, key, _ in allDs:
+                    if key in ex:
+                        text = ex[key]
+                        break
+                if text is None:
+                    text = ex.get("text") or ex.get("content") or list(ex.values())[0]
+                if isinstance(text, str) and text:
+                    if buf:
+                        buf.append(EOS_ID)
+                    buf.extend(tokenizer.encode(text).ids)
 
-        seq      = _tok_buf[:SEQ_LEN + 1]
-        _tok_buf = _tok_buf[SEQ_LEN + 1:]
-        # Correct next-token targets: tgt[i] = inp[i+1] (no padding hack)
-        inp = np.array(seq[:SEQ_LEN],       dtype=np.int32)
-        tgt = np.array(seq[1:SEQ_LEN + 1], dtype=np.int32)
-        _data_queue.put((inp, tgt))  # blocks when queue is full (backpressure)
+            seq  = buf[:SEQ_LEN + 1]
+            buf  = buf[SEQ_LEN + 1:]
+            inp  = np.array(seq[:SEQ_LEN],       dtype=np.int32)
+            tgt  = np.array(seq[1:SEQ_LEN + 1], dtype=np.int32)
+            _DATA_QUEUE.put((inp, tgt), timeout=60)
+        except Exception as e:
+            print(f"[tokenizer:{worker_id}] WARNING: {e}; restarting iterator", flush=True)
+            local_iter = iter(combined)
+            time.sleep(0.5)
 
-_tok_thread = threading.Thread(target=_tokeniser_worker, daemon=True)
-_tok_thread.start()
+_tok_processes = []
+for wid in range(_N_TOK_WORKERS):
+    p = mp.Process(target=_tokeniser_worker_proc, args=(wid,), daemon=True)
+    p.start()
+    _tok_processes.append(p)
 
 # Pre-warm: wait until we have enough sequences to fill the first optimizer step
 print(f"[data] Pre-buffering...", end=" ", flush=True)
 needed = MICRO_BATCH_SIZE * GRAD_ACCUM_STEPS
-while _data_queue.qsize() < min(needed, _DATA_QUEUE_SIZE // 2):
+while _DATA_QUEUE.qsize() < min(needed, 32):
     time.sleep(0.2)
-print(f"{_data_queue.qsize()} seqs buffered ({time.time()-t0:.1f}s)")
+print(f"{_DATA_QUEUE.qsize()} seqs buffered ({time.time()-t0:.1f}s)")
 print(f"[data] Ready ({time.time()-t0:.1f}s)\n")
 
 def get_batch() -> dict:
-    """Pull MICRO_BATCH_SIZE sequences from the prefetch queue."""
+    """Pull MICRO_BATCH_SIZE sequences from the shared queue."""
     inpSeqs = []
     tgtSeqs = []
     for _ in range(MICRO_BATCH_SIZE):
-        inp, tgt = _data_queue.get()
+        inp, tgt = _DATA_QUEUE.get(timeout=300)
         inpSeqs.append(inp)
         tgtSeqs.append(tgt)
     positions = np.broadcast_to(
@@ -238,19 +274,42 @@ def get_batch() -> dict:
         "targetIds": np.stack(tgtSeqs),
     }
 
+def _make_device_batch(batch: dict) -> dict:
+    """Place batch onto GPU devices with data-parallel sharding."""
+    return jax.device_put(batch, DATA_SHARDED)
+
 # ── Model + Optimizer ───────────────────────────────────────────────────────
 
 from src.model import DecoderOnlyLM
-from src.checkpoint import serializeCheckpoint, deserializeCheckpoint
+from src.checkpoint import (
+    serializeCheckpoint, deserializeCheckpoint,
+    has_orbax, save_checkpoint_orbax, load_checkpoint_orbax,
+)
 
 print("[model] Creating 600M model...")
 t0 = time.time()
 model = DecoderOnlyLM(modelConfig, rngs=nnx.Rngs(0))
+
+# Compute weight-decay mask: exclude embeddings (2-D but not a weight),
+# biases (1-D), and norm gains (1-D). Only 2-D Linear kernels get WD.
+params = nnx.state(model, nnx.Param)
+_wd_mask = jax.tree_util.tree_map_with_path(
+    lambda path, v: (
+        isinstance(v, jax.Array) and v.ndim >= 2
+        and "embed" not in "/".join(str(k) for k in path).lower()
+    ),
+    params,
+)
+
 optimizer = nnx.Optimizer(
     model,
     optax.chain(
         optax.clip_by_global_norm(TRAINING_CONFIG["optimizer"]["gradClipNorm"]),
-        optax.adamw(lrSchedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.01),
+        optax.scale_by_adam(b1=0.9, b2=0.95, eps=1e-8, mu_dtype=jnp.bfloat16),
+        optax.add_decayed_weights(
+            TRAINING_CONFIG["optimizer"]["weightDecay"], mask=_wd_mask,
+        ),
+        optax.scale_by_learning_rate(lrSchedule),
     ),
     wrt=nnx.Param,
 )
@@ -269,14 +328,31 @@ def _replicate():
 
 # ── Checkpoint Resume ───────────────────────────────────────────────────────
 
+def _find_latest_ckpt() -> Path | None:
+    """Find the highest-step orbax checkpoint directory."""
+    ckpt_dir = Path("/kaggle/working/checkpoints")
+    if not ckpt_dir.exists():
+        return None
+    dirs = [d for d in ckpt_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint-")]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: int(d.name.split("-")[1]))
+
 def tryResume():
     gs, ts = 0, 0
     try:
-        p      = hf_hub_download(REPO_ID, CKPT_FILE, token=hfToken)
+        if has_orbax():
+            latest = _find_latest_ckpt()
+            if latest is not None:
+                gs, ts = load_checkpoint_orbax(model, optimizer, str(latest))
+                print(f"  Resumed (orbax) step {gs} ({ts:,} tokens)")
+                return gs, ts
+        p = hf_hub_download(REPO_ID, CKPT_FILE, token=hfToken)
         _dereplicate()
         gs, ts = deserializeCheckpoint(model, optimizer, Path(p).read_bytes())
         _replicate()
-        print(f"  Resumed step {gs} ({ts:,} tokens)")
+        print(f"  Resumed (msgpack) step {gs} ({ts:,} tokens)")
     except Exception as e:
         print(f"  Fresh start ({e})")
     return gs, ts
@@ -284,16 +360,23 @@ def tryResume():
 def saveCheckpoint(gs, ts):
     d = Path("/kaggle/working/checkpoints")
     d.mkdir(parents=True, exist_ok=True)
-    p = d / f"checkpoint-{gs}.msgpack"
     try:
         _dereplicate()
-        b = serializeCheckpoint(model, optimizer, gs, ts)
-        p.write_bytes(b)
-        nb = len(b)
-        del b
+        if has_orbax():
+            ckpt_dir = d / f"checkpoint-{gs}"
+            save_checkpoint_orbax(model, optimizer, gs, ts, str(ckpt_dir))
+            print(f"  Saved (orbax) {ckpt_dir}")
+            # Convert to msgpack bytes for Hub upload (single file)
+            b = serializeCheckpoint(model, optimizer, gs, ts)
+        else:
+            p = d / f"checkpoint-{gs}.msgpack"
+            b = serializeCheckpoint(model, optimizer, gs, ts)
+            p.write_bytes(b)
+            nb = len(b)
+            print(f"  Saved local ({p}, {nb//1024**2} MB)")
         _replicate()
-        print(f"  Saved local ({p}, {nb//1024**2} MB)")
-        HF_API.upload_file(path_or_fileobj=str(p), path_in_repo=CKPT_FILE, repo_id=REPO_ID)
+        HF_API.upload_file(path_or_fileobj=b, path_in_repo=CKPT_FILE, repo_id=REPO_ID)
+        del b
         print(f"  Uploaded to Hub step {gs}")
     except Exception as e:
         print(f"  [WARN] Save failed: {e}")
@@ -301,40 +384,33 @@ def saveCheckpoint(gs, ts):
 globalStep, tokensSeen = tryResume()
 
 # ── JIT-Compiled Training Step ──────────────────────────────────────────────
-# Design: two small @nnx.jit functions instead of one monolithic one.
-#
-# WHY NOT fori_loop / lax.scan:
-#   NNX models carry stateful variables (RngCount, etc.) that live at the
-#   top-level JAX trace. lax control-flow primitives open a *new* trace level
-#   and cannot close over those variables → "Cannot extract graph node from
-#   different trace level" crash. They also require XLA to hold activations
-#   for ALL iterations simultaneously → OOM on 16 GB T4.
-#
-# WHAT WE DO INSTEAD:
-#   • micro_step: one @nnx.jit forward+backward per micro-batch.
-#     All 128 dispatches are ASYNC — JAX/XLA queues them without blocking
-#     Python. jnp.add on grads is also async.
-#   • apply_gradients: one @nnx.jit optimizer update.
-#   • float(loss_accum) at the very end is the ONLY host sync per step.
-#
-# Peak VRAM: 1 micro-batch activations (freed by remat) + full grad pytree.
+# @nnx.remat on _loss_fn recomputes all 24 block activations during backward,
+# keeping peak memory low enough for microBatch=4 per GPU.
+# On-device gradient accumulation via micro_step avoids host transfers
+# (the #3 bottleneck). The ONLY host sync is the final float(loss_accum).
 
+@nnx.remat
 def _loss_fn(model, batch):
-    """Forward pass; returns scalar loss. Block-level remat handles activation memory."""
+    """Forward pass; returns scalar loss. @nnx.remat recomputes activations during backward."""
     logits = model(batch["inputIds"], batch["positions"], enableDropout=False)
     return optax.softmax_cross_entropy_with_integer_labels(
         logits, batch["targetIds"]
     ).mean()
 
-@nnx.jit
-def micro_step(model, batch):
-    """Grad for one micro-batch [MICRO_BATCH_SIZE, SEQ_LEN]. No optimizer update."""
-    return nnx.value_and_grad(_loss_fn)(model, batch)
 
-@nnx.jit
+@nnx.jit(donate_argnames=("model", "grad_accum"))
+def micro_step_accum(model, batch, grad_accum, loss_accum):
+    """One forward+backward. Grads accumulate ON DEVICE (no host transfer)."""
+    loss, grads = nnx.value_and_grad(_loss_fn)(model, batch)
+    grad_accum = jax.tree.map(jnp.add, grad_accum, grads)
+    return grad_accum, loss_accum + loss
+
+
+@nnx.jit(donate_argnames=("model", "optimizer"))
 def apply_gradients(model, optimizer, avg_grads):
     """Apply pre-averaged gradients. Separated so optimizer.update runs on-device."""
     optimizer.update(model, avg_grads)
+
 
 # ── Training Loop ───────────────────────────────────────────────────────────
 
@@ -344,8 +420,8 @@ CKPT_INTERVAL = 900    # 15 minutes
 print(f"\n{'='*50}")
 print(f"Session: {SESH_DURATION}s  CKPT: {CKPT_INTERVAL}s")
 print(f"Resume: step {globalStep}  tokens {tokensSeen:,}")
-print(f"Micro-batch: {MICRO_BATCH_SIZE} seq ({MICRO_BATCH_SIZE * SEQ_LEN:,} tok/micro), "
-      f"accum {GRAD_ACCUM_STEPS} -> {nTokensPerStep:,} tok/step")
+print(f"Micro-batch: {MICRO_BATCH_SIZE} seq ({MICRO_BATCH_SIZE * SEQ_LEN:,} tok/micro, "
+      f"{N_GPUS} GPU(s)), accum {GRAD_ACCUM_STEPS} -> {nTokensPerStep:,} tok/step")
 print(f"{'='*50}\n")
 
 step          = globalStep
@@ -354,60 +430,33 @@ startTime     = lastCkptTime = time.time()
 sessionFailed = False
 nSamples      = 0
 
-def _make_device_batch(mb: dict) -> dict:
-    """Convert a numpy micro-batch dict to JAX arrays on the default GPU."""
-    return {k: jnp.array(v) for k, v in mb.items()}
+# Build a zero-gradient pytree for the accumulator (same structure as params)
+_zero_grads = jax.tree.map(lambda p: jnp.zeros_like(p), nnx.state(model, nnx.Param))
 
 try:
     while time.time() - startTime < SESH_DURATION:
-        # ── Gradient accumulation on Host RAM ─────────────────────────────
-        # To avoid OOM, we do not accumulate gradients in GPU memory.
-        # Instead, after each micro_step, we transfer the gradients to host
-        # memory (CPU RAM, which has plenty of headroom: 30 GB vs 15 GB on GPU)
-        # using jax.device_get, accumulate them on CPU, and delete the GPU copy.
-        # This saves 2.4 GB of VRAM per GPU, preventing OOM.
-        grads_accum = None
-        loss_accum  = 0.0   # plain Python float
+        # ── On-device gradient accumulation ────────────────────────────────
+        # grads accumulate via jnp.add inside @nnx.jit (no host transfer).
+        # Only float(loss_accum) at the end syncs to host.
 
         if step == globalStep:
-            print(f"  [JIT] Compiling micro_step + apply_gradients "
+            print(f"  [JIT] Compiling micro_step_accum + apply_gradients "
                   f"(first step ~60-180s)...", flush=True)
+
+        grad_accum = _zero_grads
+        loss_accum = jnp.float32(0.0)
 
         for _ in range(GRAD_ACCUM_STEPS):
             batch = _make_device_batch(get_batch())
-            loss, grads = micro_step(model, batch)
-            
-            # Sync scalar to CPU first (tiny, fast; avoids sharding issues).
-            loss_accum += float(loss)
-            
-            # Transfer grads to CPU and accumulate there to save GPU memory
-            grads_cpu = jax.device_get(grads)
-            if grads_accum is None:
-                grads_accum = grads_cpu
-            else:
-                # Accumulate on CPU in-place to avoid allocating new 2.4 GB arrays
-                jax.tree.map(lambda x, y: np.add(x, y, out=x), grads_accum, grads_cpu)
-            
-            # Clean up device and host references immediately
-            del grads, grads_cpu
-            
-        # Average on CPU in-place
-        avg_grads_cpu = jax.tree.map(lambda g: np.divide(g, GRAD_ACCUM_STEPS, out=g), grads_accum)
-        
-        # Move avg_grads back to GPU with appropriate sharding
-        avg_grads = jax.device_put(avg_grads_cpu)
-            
-        apply_gradients(model, optimizer, avg_grads)
-        jax.block_until_ready(nnx.state(model, nnx.Param))  # ensure update lands
-        
-        # Clean up CPU references
-        del grads_accum, avg_grads_cpu, avg_grads
-        gc.collect()
+            grad_accum, loss_accum = micro_step_accum(model, batch, grad_accum, loss_accum)
 
-        avg_loss = loss_accum / GRAD_ACCUM_STEPS
+        avg_loss = float(loss_accum) / GRAD_ACCUM_STEPS  # single host sync
 
         if np.isnan(avg_loss) or np.isinf(avg_loss):
             raise RuntimeError(f"Diverged at step {step + 1}: {avg_loss}")
+
+        avg_grads = jax.tree.map(lambda g: g / GRAD_ACCUM_STEPS, grad_accum)
+        apply_gradients(model, optimizer, avg_grads)
 
         totalTokens += nTokensPerStep
         step        += 1

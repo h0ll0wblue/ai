@@ -1,7 +1,11 @@
 """Checkpoint serialization helpers for Flax NNX.
 
-Uses float16 for storage to halve checkpoint size (~3.6GB for 600M).
-Writes to disk and reads from disk to avoid keeping 3.6GB in Python memory.
+Uses float16 for storage of model weights (halves checkpoint size for 600M).
+Optimizer state (Adam m, v) is kept in fp32 — float16 corrupts v (underflows to
+zero) causing NaN on resume.
+Supports two backends:
+  - Orbax (v0.5+): memory-efficient directory-based checkpointing (preferred).
+  - Msgpack: single-file serialization (fallback, also used for Hub upload).
 """
 
 import io
@@ -12,21 +16,30 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def _arrays_to_lists(d):
+try:
+    import orbax.checkpoint as ocp
+    _HAS_ORBAX = True
+except ImportError:
+    _HAS_ORBAX = False
+
+
+def _arrays_to_lists(d, allow_f16_compress=False):
     if isinstance(d, dict):
-        return {k: _arrays_to_lists(v) for k, v in d.items()}
+        return {k: _arrays_to_lists(v, allow_f16_compress) for k, v in d.items()}
     elif isinstance(d, list):
-        return [_arrays_to_lists(v) for v in d]
+        return [_arrays_to_lists(v, allow_f16_compress) for v in d]
     elif isinstance(d, (jnp.ndarray, np.ndarray)):
         arr = np.asarray(d)
         origDtype = str(arr.dtype)
         storedDtype = origDtype
-        if arr.dtype in (np.float32, np.float64):
+        # Only compress MODEL WEIGHTS (large, tolerant of f16).
+        # NEVER compress optimizer state — Adam v underflows and causes NaN.
+        if allow_f16_compress and arr.dtype in (np.float32, np.float64):
             arr = arr.astype(np.float16)
             storedDtype = "float16"
         return {
             "__ndarray__": True,
-            "shape": list(d.shape),
+            "shape": list(arr.shape),
             "dtype": origDtype,
             "stored_dtype": storedDtype,
             "data": msgpack.dumps(arr.tobytes()),
@@ -54,19 +67,19 @@ def _lists_to_arrays(d):
     return d
 
 
-def _to_bytes(state):
-    """Serialize nnx state to msgpack bytes via float16 compression."""
+def _to_bytes(state, allow_f16_compress=False):
+    """Serialize nnx state to msgpack bytes, optionally compressing f32 to f16."""
     pure = nnx.to_pure_dict(state)
-    return msgpack.dumps(_arrays_to_lists(pure))
+    return msgpack.dumps(_arrays_to_lists(pure, allow_f16_compress))
 
 
 def serializeCheckpoint(model, optimizer, step, tokensSeen):
-    """Serialize model + optimizer state to msgpack bytes (float16 compressed)."""
+    """Serialize model + optimizer state to msgpack bytes."""
     params = nnx.state(model, nnx.Param)
     optState = nnx.state(optimizer)
     ckpt = {
-        "model": _to_bytes(params),
-        "optimizer": _to_bytes(optState),
+        "model":     _to_bytes(params,  allow_f16_compress=True),   # weights: f16 OK
+        "optimizer": _to_bytes(optState, allow_f16_compress=False), # f32 preserved
         "step": step,
         "tokensSeen": tokensSeen,
     }
@@ -81,11 +94,51 @@ def _from_bytes(data):
 def deserializeCheckpoint(model, optimizer, data):
     """Restore model + optimizer state from bytes. Returns (step, tokensSeen)."""
     ckpt = msgpack.loads(data, strict_map_key=False)
-    modelState = nnx.state(model, nnx.Param)
-    nnx.replace_by_pure_dict(modelState, _from_bytes(ckpt["model"]))
-    nnx.update(model, modelState)
+    nnx.update(model, _from_bytes(ckpt["model"]))
     if "optimizer" in ckpt:
-        optState = nnx.state(optimizer)
-        nnx.replace_by_pure_dict(optState, _from_bytes(ckpt["optimizer"]))
-        nnx.update(optimizer, optState)
+        nnx.update(optimizer, _from_bytes(ckpt["optimizer"]))
     return ckpt.get("step", 0), ckpt.get("tokensSeen", 0)
+
+
+# ── Orbax backend (optional, v0.5+) ───────────────────────────────────────────
+
+if _HAS_ORBAX:
+
+    def save_checkpoint_orbax(model, optimizer, step, tokensSeen, path):
+        """Save checkpoint using Orbax (async, memory-efficient, directory-based)."""
+        checkpointer = ocp.PyTreeCheckpointer()
+        checkpointer.save(
+            path,
+            {
+                "model": nnx.state(model, nnx.Param),
+                "optimizer": nnx.state(optimizer),
+                "step": step,
+                "tokensSeen": tokensSeen,
+            },
+            force_ckpt=True,
+        )
+
+    def load_checkpoint_orbax(model, optimizer, path):
+        """Restore checkpoint from Orbax directory. Returns (step, tokensSeen)."""
+        checkpointer = ocp.PyTreeCheckpointer()
+        restored = checkpointer.restore(path)
+        modelState = nnx.state(model, nnx.Param)
+        nnx.replace_by_pure_dict(modelState, restored["model"])
+        nnx.update(model, modelState)
+        optState = nnx.state(optimizer)
+        nnx.replace_by_pure_dict(optState, restored["optimizer"])
+        nnx.update(optimizer, optState)
+        return restored.get("step", 0), restored.get("tokensSeen", 0)
+
+else:
+    # Stub: fall back silently when orbax is not installed.
+    def save_checkpoint_orbax(model, optimizer, step, tokensSeen, path):
+        raise RuntimeError("orbax-checkpoint not installed; use msgpack backend")
+
+    def load_checkpoint_orbax(model, optimizer, path):
+        raise RuntimeError("orbax-checkpoint not installed; use msgpack backend")
+
+
+def has_orbax() -> bool:
+    """Whether Orbax is available for checkpointing."""
+    return _HAS_ORBAX
