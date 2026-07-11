@@ -43,14 +43,6 @@ class DecoderOnlyLM(nnx.Module):
             for i in range(config.nLayers)
         ])
 
-        self._scan_fn = nnx.scan(
-            self._block_fn,
-            in_axes=(nnx.Carry, None, None),
-            out_axes=nnx.Carry,
-            length=config.nLayers,
-            unroll=2,
-        )
-
         self.finalNorm = RmsNorm(config.dModel, config.rmsNormEps)
 
         if not self.tieEmbeddings:
@@ -59,12 +51,13 @@ class DecoderOnlyLM(nnx.Module):
                 rngs=nnx.Rngs(rngs()),
             )
 
-    def _block_fn(self, x, positions, enableDropout):
+    @nnx.scan(in_axes=(nnx.Carry, None, None), out_axes=nnx.Carry, length=24, unroll=2)
+    def _scan_blocks(self, x, positions, enableDropout):
         return self.blocks(x, positions, enableDropout=enableDropout)
 
     def __call__(self, inputIds: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         x = self.tokenEmbed(inputIds)
-        x = self._scan_fn(x, positions, enableDropout)
+        x = self._scan_blocks(x, positions, enableDropout)
         x = self.finalNorm(x)
         if self.tieEmbeddings:
             logits = x @ self.tokenEmbed.weight.T

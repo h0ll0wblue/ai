@@ -1,8 +1,12 @@
 totalTokens: 12_000_000_000
 seqLen: 4096
-microBatchPerChip: 4
-nChips: 8
-gradAccumSteps: 8
+
+# Values below are for Kaggle dual T4:
+#   effectiveBatch = microBatchPerChip * nChips * gradAccumSteps = 128
+#   tokensPerStep = 128 * 4096 = 524,288
+microBatchPerChip: 1
+nChips: 2
+gradAccumSteps: 128
 
 optimizer:
   name: adamw

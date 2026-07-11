@@ -97,7 +97,7 @@ class GroupedQueryAttention(nnx.Module):
         v = v.transpose(0, 2, 1, 3)
 
         output = jax.nn.dot_product_attention(
-            q, k, v, is_causal=True, implementation="xla"
+            q, k, v, is_causal=True
         )
 
         if enableDropout and self.attnDropout > 0.0:

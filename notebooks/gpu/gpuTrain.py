@@ -32,11 +32,11 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "bfloat16"
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/kaggle/working/.cache/jax"
 
 # XLA GPU flags: fuse softmax with attention matmul via Triton, overlap compute
-# with memory via latency-hiding scheduler, enable async collectives for multi-GPU.
+# with memory via latency-hiding scheduler, reduce compilation overhead.
+# NOTE: async collectives removed — T4 (CC 7.5) doesn't support them.
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_enable_triton_softmax_fusion=true "
     "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_async_all_gather=true "
     "--xla_gpu_all_reduce_combine_threshold_bytes=1073741824"
 )
 

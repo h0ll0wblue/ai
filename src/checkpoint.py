@@ -94,9 +94,13 @@ def _from_bytes(data):
 def deserializeCheckpoint(model, optimizer, data):
     """Restore model + optimizer state from bytes. Returns (step, tokensSeen)."""
     ckpt = msgpack.loads(data, strict_map_key=False)
-    nnx.update(model, _from_bytes(ckpt["model"]))
+    modelState = nnx.state(model, nnx.Param)
+    nnx.replace_by_pure_dict(modelState, _from_bytes(ckpt["model"]))
+    nnx.update(model, modelState)
     if "optimizer" in ckpt:
-        nnx.update(optimizer, _from_bytes(ckpt["optimizer"]))
+        optState = nnx.state(optimizer)
+        nnx.replace_by_pure_dict(optState, _from_bytes(ckpt["optimizer"]))
+        nnx.update(optimizer, optState)
     return ckpt.get("step", 0), ckpt.get("tokensSeen", 0)
 
 
