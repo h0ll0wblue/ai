@@ -31,14 +31,8 @@ os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "bfloat16"
 # on resume. Persists on /kaggle/working disk.
 os.environ["JAX_COMPILATION_CACHE_DIR"] = "/kaggle/working/.cache/jax"
 
-# XLA GPU flags: fuse softmax with attention matmul via Triton, overlap compute
-# with memory via latency-hiding scheduler, reduce compilation overhead.
-# NOTE: async collectives removed — T4 (CC 7.5) doesn't support them.
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_enable_triton_softmax_fusion=true "
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_all_reduce_combine_threshold_bytes=1073741824"
-)
+# XLA flags intentionally omitted: Triton softmax fusion and latency-hiding
+# scheduler can crash XLA init on Kaggle T4 depending on JAX build.
 
 
 import sys
@@ -398,7 +392,7 @@ def _loss_fn(model, batch):
     ).mean()
 
 
-@nnx.jit(donate_argnames=("model", "grad_accum"))
+@nnx.jit
 def micro_step_accum(model, batch, grad_accum, loss_accum):
     """One forward+backward. Grads accumulate ON DEVICE (no host transfer)."""
     loss, grads = nnx.value_and_grad(_loss_fn)(model, batch)
@@ -406,7 +400,7 @@ def micro_step_accum(model, batch, grad_accum, loss_accum):
     return grad_accum, loss_accum + loss
 
 
-@nnx.jit(donate_argnames=("model", "optimizer"))
+@nnx.jit
 def apply_gradients(model, optimizer, avg_grads):
     """Apply pre-averaged gradients. Separated so optimizer.update runs on-device."""
     optimizer.update(model, avg_grads)

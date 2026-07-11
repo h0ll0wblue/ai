@@ -31,7 +31,7 @@ class DecoderOnlyLM(nnx.Module):
         self.nLayers = config.nLayers
         layerKeys = jax.random.split(layersKey, config.nLayers)
 
-        self.blocks = nnx.List([
+        self.blocks = [
             TransformerBlock(
                 config.dModel, config.dFF,
                 config.nQueryHeads, config.nKVHeads,
@@ -41,7 +41,7 @@ class DecoderOnlyLM(nnx.Module):
                 attnDropout=self.attnDropout,
             )
             for i in range(config.nLayers)
-        ])
+        ]
 
         self.finalNorm = RmsNorm(config.dModel, config.rmsNormEps)
 
@@ -51,13 +51,10 @@ class DecoderOnlyLM(nnx.Module):
                 rngs=nnx.Rngs(rngs()),
             )
 
-    @nnx.scan(in_axes=(nnx.Carry, None, None), out_axes=nnx.Carry, length=24, unroll=2)
-    def _scan_blocks(self, x, positions, enableDropout):
-        return self.blocks(x, positions, enableDropout=enableDropout)
-
     def __call__(self, inputIds: jax.Array, positions: jax.Array, enableDropout: bool = True) -> jax.Array:
         x = self.tokenEmbed(inputIds)
-        x = self._scan_blocks(x, positions, enableDropout)
+        for block in self.blocks:
+            x = block(x, positions, enableDropout=enableDropout)
         x = self.finalNorm(x)
         if self.tieEmbeddings:
             logits = x @ self.tokenEmbed.weight.T
